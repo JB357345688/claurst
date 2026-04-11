@@ -254,7 +254,47 @@ fn normalize_ollama_api_base(api_base: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_ollama_api_base;
+    use super::{
+        ProviderResolutionError, ResolutionSource, normalize_ollama_api_base,
+        resolve_provider_identity,
+    };
+    use claurst_api::ModelRegistry;
+
+    fn assert_identity(
+        explicit_provider: Option<&str>,
+        model: &str,
+        model_registry: Option<&ModelRegistry>,
+        expected_provider: &str,
+        expected_model: &str,
+        expected_source: ResolutionSource,
+    ) {
+        let identity = resolve_provider_identity(explicit_provider, model, model_registry)
+            .expect("resolution should succeed");
+
+        assert_eq!(identity.provider_id, expected_provider);
+        assert_eq!(identity.model_id, expected_model);
+        assert_eq!(identity.resolution_source, expected_source);
+    }
+
+    fn assert_provider_model_conflict(
+        explicit_provider: &str,
+        model: &str,
+        expected_model_provider: &str,
+    ) {
+        let error = resolve_provider_identity(Some(explicit_provider), model, None)
+            .expect_err("resolution should fail with provider/model conflict");
+
+        assert!(matches!(
+            error,
+            ProviderResolutionError::ProviderModelConflict {
+                provider,
+                model: error_model,
+                model_provider,
+            } if provider == explicit_provider
+                && error_model == model
+                && model_provider == expected_model_provider
+        ));
+    }
 
     #[test]
     fn normalize_ollama_api_base_rewrites_hosted_api_root() {
@@ -289,6 +329,144 @@ mod tests {
         assert_eq!(
             normalize_ollama_api_base("https://ollama.com/v1"),
             "https://ollama.com/v1"
+        );
+    }
+
+    #[test]
+    fn p1_explicit_provider_matches_model_prefix() {
+        assert_identity(
+            Some("openai"),
+            "openai/gpt-4o",
+            None,
+            "openai",
+            "gpt-4o",
+            ResolutionSource::ExplicitProvider,
+        );
+    }
+
+    #[test]
+    fn p2_explicit_provider_with_bare_model() {
+        assert_identity(
+            Some("openai"),
+            "gpt-4o",
+            None,
+            "openai",
+            "gpt-4o",
+            ResolutionSource::ExplicitProvider,
+        );
+    }
+
+    #[test]
+    fn p3_explicit_provider_conflicts_with_model_prefix() {
+        assert_provider_model_conflict(
+            "openai",
+            "anthropic/claude-sonnet-4-20250514",
+            "anthropic",
+        );
+    }
+
+    #[test]
+    fn p4_no_provider_with_known_model_prefix() {
+        assert_identity(
+            None,
+            "google/gemini-2.5-flash",
+            None,
+            "google",
+            "gemini-2.5-flash",
+            ResolutionSource::ModelStringPrefix,
+        );
+    }
+
+    #[test]
+    fn p5_explicit_provider_conflicts_with_reverse_model_prefix() {
+        assert_provider_model_conflict("anthropic", "openai/gpt-4o", "openai");
+    }
+
+    #[test]
+    fn p6_explicit_anthropic_pin_with_bare_model() {
+        assert_identity(
+            Some("anthropic"),
+            "claude-sonnet-4-20250514",
+            None,
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            ResolutionSource::ExplicitProvider,
+        );
+    }
+
+    #[test]
+    fn p7_no_provider_with_unknown_namespace_defaults() {
+        assert_identity(
+            None,
+            "meta-llama/Llama-3.3-70B",
+            None,
+            "anthropic",
+            "meta-llama/Llama-3.3-70B",
+            ResolutionSource::Default,
+        );
+    }
+
+    #[test]
+    fn p8_no_provider_bare_model_registry_resolves() {
+        let model_registry = ModelRegistry::new();
+
+        assert_identity(
+            None,
+            "gemini-3-flash-preview",
+            Some(&model_registry),
+            "google",
+            "gemini-3-flash-preview",
+            ResolutionSource::ModelRegistry,
+        );
+    }
+
+    #[test]
+    fn p9_no_provider_bare_model_registry_has_no_match() {
+        let model_registry = ModelRegistry::new();
+
+        assert_identity(
+            None,
+            "some-unknown-model",
+            Some(&model_registry),
+            "anthropic",
+            "some-unknown-model",
+            ResolutionSource::Default,
+        );
+    }
+
+    #[test]
+    fn p10_no_provider_without_model_registry_defaults() {
+        assert_identity(
+            None,
+            "claude-sonnet-4-20250514",
+            None,
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            ResolutionSource::Default,
+        );
+    }
+
+    #[test]
+    fn p11_explicit_provider_with_nested_slash_model() {
+        assert_identity(
+            Some("openrouter"),
+            "openrouter/meta-llama/Llama-3.3-70B",
+            None,
+            "openrouter",
+            "meta-llama/Llama-3.3-70B",
+            ResolutionSource::ExplicitProvider,
+        );
+    }
+
+    #[test]
+    fn p12_local_provider_with_bare_model() {
+        assert_identity(
+            Some("ollama"),
+            "llama3",
+            None,
+            "ollama",
+            "llama3",
+            ResolutionSource::ExplicitProvider,
         );
     }
 }
