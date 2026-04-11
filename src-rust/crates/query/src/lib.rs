@@ -853,444 +853,323 @@ pub async fn run_query_loop(
             Arc::new(claurst_api::streaming::NullStreamHandler)
         };
 
-        // Non-Anthropic provider dispatch: if the model is "provider/model"
-        // format and the registry has that provider, use it directly.
-        //
-        // Provider resolution priority:
-        //   1. Explicit "provider/model" format in the model string
-        //   2. config.provider setting (from --provider flag or settings.json)
-        //   3. Model registry lookup (e.g. "gemini-3-flash-preview" → google)
-        //   4. Default to "anthropic"
+        // Registry-backed provider dispatch flows through the shared provider
+        // resolution seam. Failures in this path return immediately and do
+        // not fall through to the raw Anthropic client path below.
         if let Some(ref registry) = config.provider_registry {
-            let (provider_id_str, model_id_str) = if let Some(p) = tool_ctx.config.provider.as_deref().filter(|p| *p != "anthropic") {
-                // Explicit non-Anthropic provider in config — use it.
-                // If the stored model is in canonical "provider/model" form,
-                // strip the top-level provider prefix before sending it to the
-                // provider adapter. If it contains an additional slash
-                // (e.g. "meta-llama/Llama-3.3..." on OpenRouter), preserve it.
-                let provider_prefix = format!("{}/", p);
-                let model_id = effective_model
-                    .strip_prefix(&provider_prefix)
-                    .unwrap_or(&effective_model)
-                    .to_string();
-                (p.to_string(), model_id)
-            } else if let Some((p, m)) = effective_model.split_once('/') {
-                // No explicit provider but model has "provider/model" format.
-                // Check whether `p` is a known provider or just a model
-                // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
-                let known_providers = [
-                    "anthropic", "openai", "google", "groq", "mistral",
-                    "deepseek", "xai", "cohere", "perplexity", "cerebras",
-                    "openrouter", "togetherai", "together-ai", "deepinfra",
-                    "venice", "github-copilot", "ollama", "lmstudio",
-                    "llamacpp", "azure", "amazon-bedrock", "huggingface",
-                    "nvidia", "fireworks", "sambanova",
-                ];
-                if known_providers.contains(&p) {
-                    (p.to_string(), m.to_string())
-                } else {
-                    // Treat the whole string as the model ID, fall through
-                    // to auto-detection below.
-                    let fallback_provider = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
-                    (fallback_provider.to_string(), effective_model.clone())
-                }
-            } else {
-                // No explicit provider set (or set to "anthropic"): try the
-                // model registry to auto-detect provider from the model name.
-                // Use the shared model registry from QueryConfig if available;
-                // otherwise construct a temporary one.
-                let temp_reg;
-                let model_reg: &claurst_api::ModelRegistry = if let Some(ref shared) = config.model_registry {
-                    shared
-                } else {
-                    temp_reg = {
-                        let mut r = claurst_api::ModelRegistry::new();
-                        if let Some(cache_dir) = dirs::cache_dir() {
-                            let cache_path = cache_dir.join("claurst").join("models_dev.json");
-                            r.load_cache(&cache_path);
-                        }
-                        r
-                    };
-                    &temp_reg
-                };
-                if let Some(detected_pid) = model_reg.find_provider_for_model(&effective_model) {
-                    let pid_str = detected_pid.to_string();
-                    if pid_str != "anthropic" {
-                        (pid_str, effective_model.clone())
-                    } else {
-                        ("anthropic".to_string(), effective_model.clone())
-                    }
-                } else {
-                    // Fall back to config.provider (may be "anthropic" or None→"anthropic")
-                    let p = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
-                    (p.to_string(), effective_model.clone())
+            let identity = match provider_resolution::resolve_provider_identity(
+                tool_ctx.config.provider.as_deref(),
+                &effective_model,
+                config.model_registry.as_deref(),
+            ) {
+                Ok(identity) => identity,
+                Err(e) => {
+                    error!(model = %effective_model, error = %e, "Provider resolution failed");
+                    return QueryOutcome::Error(ClaudeError::Api(e.to_string()));
                 }
             };
 
-            // Dispatch through the provider path for non-Anthropic providers,
-            // AND for Anthropic when the pre-built client has no API key
-            // (user started without ANTHROPIC_API_KEY but added one via /connect).
-            let use_provider_dispatch = provider_id_str != "anthropic"
-                || client.api_key_is_empty();
-
-            if use_provider_dispatch {
-                let pid = claurst_core::provider_id::ProviderId::new(&provider_id_str);
-
-                // Always prefer a fresh provider built from the auth_store so
-                // that keys added at runtime via /connect are picked up
-                // immediately — even when the provider was pre-registered at
-                // startup with a stale or missing key.
-                let runtime_provider =
-                    claurst_api::registry::runtime_provider_for(&provider_id_str);
-
-                let mut registry_provider = if runtime_provider.is_some() {
-                    // Fresh auth_store key available — use it instead of the
-                    // (possibly stale) registry entry.
-                    None
-                } else {
-                    registry.get(&pid).cloned()
-                };
-
-                // If the user supplied --api-base for a local provider (Ollama, LM Studio,
-                // llama.cpp), rebuild the provider with the override URL.  These providers
-                // are always pre-registered with a hardcoded default URL, so without this
-                // the --api-base flag would be silently ignored.
-                if let Some(override_base) = tool_ctx.config.provider_configs
-                    .get(&provider_id_str)
-                    .and_then(|pc| pc.api_base.as_deref())
-                {
-                    use claurst_api::providers::openai_compat_providers;
-                    let base_url = format!("{}/v1", override_base.trim_end_matches('/'));
-                    let overridden: Option<std::sync::Arc<dyn claurst_api::LlmProvider>> =
-                        match provider_id_str.as_str() {
-                            "ollama" => Some(std::sync::Arc::new(
-                                openai_compat_providers::ollama().with_base_url(base_url),
-                            )),
-                            "lmstudio" | "lm-studio" => Some(std::sync::Arc::new(
-                                openai_compat_providers::lm_studio().with_base_url(base_url),
-                            )),
-                            "llamacpp" | "llama-cpp" => Some(std::sync::Arc::new(
-                                openai_compat_providers::llama_cpp().with_base_url(base_url),
-                            )),
-                            _ => None,
-                        };
-                    if overridden.is_some() {
-                        registry_provider = overridden;
-                    }
+            let target = match provider_resolution::materialize_provider(
+                &identity,
+                registry,
+                &tool_ctx.config.provider_configs,
+            ) {
+                Ok(target) => target,
+                Err(e) => {
+                    error!(
+                        provider = %identity.provider_id,
+                        model = %identity.model_id,
+                        error = %e,
+                        "Provider materialization failed"
+                    );
+                    return QueryOutcome::Error(ClaudeError::Api(e.to_string()));
                 }
+            };
 
-                let provider = runtime_provider.or(registry_provider);
-                if let Some(provider) = provider {
-                    debug!(provider = %provider_id_str, model = %model_id_str, "Dispatching to non-Anthropic provider");
+            let provider = target.provider.clone();
+            debug!(provider = %target.provider_id, model = %target.model_id, "Dispatching to registry-backed provider");
 
-                    // Notify TUI that we're calling the provider
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::Status(format!("Calling {} ({})…", provider.name(), model_id_str)));
-                    }
+            // Notify TUI that we're calling the provider
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::Status(format!(
+                    "Calling {} ({})…",
+                    provider.name(),
+                    target.model_id
+                )));
+            }
 
-                    // Build ProviderRequest from the already-assembled request data.
-                    // tools comes from the api_tools we already built above.
-                    // Filter unsupported modalities: replace Image/Document blocks
-                    // with placeholder text when the provider doesn't support them,
-                    // preventing crashes on text-only models.
-                    let mut caps = provider.capabilities();
-                    if let Some(model_entry) = config
-                        .model_registry
-                        .as_ref()
-                        .and_then(|model_registry| model_registry.get(&provider_id_str, &model_id_str))
-                    {
-                        caps.image_input = model_entry.vision;
-                        caps.tool_calling = model_entry.tool_calling;
-                        caps.thinking = model_entry.reasoning;
-                    }
-                    let provider_tools: Vec<claurst_core::types::ToolDefinition> = if caps.tool_calling {
-                        tools.iter().map(|t| t.to_definition()).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let provider_messages: Vec<claurst_core::types::Message> = messages
-                        .iter()
-                        .map(|msg| {
-                            let mut msg = msg.clone();
-                            if let claurst_core::types::MessageContent::Blocks(ref mut blocks) = msg.content {
-                                for block in blocks.iter_mut() {
-                                    match block {
-                                        claurst_core::types::ContentBlock::Image { .. } if !caps.image_input => {
-                                            *block = claurst_core::types::ContentBlock::Text {
-                                                text: "[Image not supported by this model]".to_string(),
-                                            };
-                                        }
-                                        claurst_core::types::ContentBlock::Document { .. } if !caps.pdf_input => {
-                                            *block = claurst_core::types::ContentBlock::Text {
-                                                text: "[PDF not supported by this model]".to_string(),
-                                            };
-                                        }
-                                        _ => {}
-                                    }
+            // Build ProviderRequest from the already-assembled request data.
+            // tools comes from the api_tools we already built above.
+            // Filter unsupported modalities: replace Image/Document blocks
+            // with placeholder text when the provider doesn't support them,
+            // preventing crashes on text-only models.
+            let mut caps = provider.capabilities();
+            if let Some(model_entry) = config
+                .model_registry
+                .as_ref()
+                .and_then(|model_registry| model_registry.get(&target.provider_id, &target.model_id))
+            {
+                caps.image_input = model_entry.vision;
+                caps.tool_calling = model_entry.tool_calling;
+                caps.thinking = model_entry.reasoning;
+            }
+            let provider_tools: Vec<claurst_core::types::ToolDefinition> = if caps.tool_calling {
+                tools.iter().map(|t| t.to_definition()).collect()
+            } else {
+                Vec::new()
+            };
+            let provider_messages: Vec<claurst_core::types::Message> = messages
+                .iter()
+                .map(|msg| {
+                    let mut msg = msg.clone();
+                    if let claurst_core::types::MessageContent::Blocks(ref mut blocks) = msg.content {
+                        for block in blocks.iter_mut() {
+                            match block {
+                                claurst_core::types::ContentBlock::Image { .. } if !caps.image_input => {
+                                    *block = claurst_core::types::ContentBlock::Text {
+                                        text: "[Image not supported by this model]".to_string(),
+                                    };
                                 }
+                                claurst_core::types::ContentBlock::Document { .. } if !caps.pdf_input => {
+                                    *block = claurst_core::types::ContentBlock::Text {
+                                        text: "[PDF not supported by this model]".to_string(),
+                                    };
+                                }
+                                _ => {}
                             }
-                            msg
-                        })
-                        .collect();
-
-                    let provider_request = claurst_api::ProviderRequest {
-                        model: model_id_str.to_owned(),
-                        messages: provider_messages,
-                        system_prompt: Some(system_for_provider.clone()),
-                        tools: provider_tools,
-                        max_tokens: config.max_tokens,
-                        temperature: effective_temperature.map(|t| t as f64),
-                        top_p: None,
-                        top_k: None,
-                        stop_sequences: vec![],
-                        thinking: if caps.thinking {
-                            effective_thinking_budget
-                                .map(|b| claurst_api::ThinkingConfig::enabled(b))
-                        } else {
-                            None
-                        },
-                        provider_options: build_provider_options(
-                            &provider_id_str,
-                            &model_id_str,
-                            config.effort_level,
-                            effective_thinking_budget,
-                        ),
-                    };
-
-                    // Use create_message_stream so the TUI receives real-time
-                    // text deltas instead of waiting for the full response.
-                    let mut stream = match provider.create_message_stream(provider_request).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(provider = %provider_id_str, error = %e, "Provider stream failed");
-                            return QueryOutcome::Error(
-                                claurst_core::error::ClaudeError::Api(e.to_string())
-                            );
                         }
-                    };
+                    }
+                    msg
+                })
+                .collect();
 
-                    // Accumulators for building the final assistant message.
-                    let mut text_chunks: Vec<String> = Vec::new();
-                    // tool_call_blocks: index → (id, name, accumulated_json)
-                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String)> =
-                        std::collections::HashMap::new();
-                    let mut usage = UsageInfo::default();
-                    let mut stop_str = "end_turn".to_string();
-                    let mut msg_id = uuid::Uuid::new_v4().to_string();
+            let provider_request = claurst_api::ProviderRequest {
+                model: target.model_id.to_owned(),
+                messages: provider_messages,
+                system_prompt: Some(system_for_provider.clone()),
+                tools: provider_tools,
+                max_tokens: config.max_tokens,
+                temperature: effective_temperature.map(|t| t as f64),
+                top_p: None,
+                top_k: None,
+                stop_sequences: vec![],
+                thinking: if caps.thinking {
+                    effective_thinking_budget
+                        .map(|b| claurst_api::ThinkingConfig::enabled(b))
+                } else {
+                    None
+                },
+                provider_options: build_provider_options(
+                    &target.provider_id,
+                    &target.model_id,
+                    config.effort_level,
+                    effective_thinking_budget,
+                ),
+            };
 
-                    use futures::StreamExt as ProviderStreamExt;
-                    let provider_stall_timeout = std::time::Duration::from_secs(45);
-                    let provider_stall = tokio::time::sleep(provider_stall_timeout);
-                    tokio::pin!(provider_stall);
-                    let mut provider_stream_stalled = false;
+            // Use create_message_stream so the TUI receives real-time
+            // text deltas instead of waiting for the full response.
+            let mut stream = match provider.create_message_stream(provider_request).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(provider = %target.provider_id, error = %e, "Provider stream failed");
+                    return QueryOutcome::Error(
+                        claurst_core::error::ClaudeError::Api(e.to_string())
+                    );
+                }
+            };
 
-                    loop {
-                        tokio::select! {
-                            _ = cancel_token.cancelled() => {
-                                return QueryOutcome::Cancelled;
-                            }
-                            _ = &mut provider_stall => {
-                                provider_stream_stalled = true;
+            // Accumulators for building the final assistant message.
+            let mut text_chunks: Vec<String> = Vec::new();
+            // tool_call_blocks: index → (id, name, accumulated_json)
+            let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String)> =
+                std::collections::HashMap::new();
+            let mut usage = UsageInfo::default();
+            let mut stop_str = "end_turn".to_string();
+            let mut msg_id = uuid::Uuid::new_v4().to_string();
+
+            use futures::StreamExt as ProviderStreamExt;
+            let provider_stall_timeout = std::time::Duration::from_secs(45);
+            let provider_stall = tokio::time::sleep(provider_stall_timeout);
+            tokio::pin!(provider_stall);
+            let mut provider_stream_stalled = false;
+
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        return QueryOutcome::Cancelled;
+                    }
+                    _ = &mut provider_stall => {
+                        provider_stream_stalled = true;
+                        break;
+                    }
+                    event = stream.next() => {
+                        provider_stall.as_mut().reset(tokio::time::Instant::now() + provider_stall_timeout);
+                        match event {
+                            None => break,
+                            Some(Err(e)) => {
+                                error!(provider = %target.provider_id, error = %e, "Provider stream error");
                                 break;
                             }
-                            event = stream.next() => {
-                                provider_stall.as_mut().reset(tokio::time::Instant::now() + provider_stall_timeout);
-                                match event {
-                                    None => break,
-                                    Some(Err(e)) => {
-                                        error!(provider = %provider_id_str, error = %e, "Provider stream error");
-                                        break;
+                            Some(Ok(evt)) => {
+                                // Forward to TUI via AnthropicStreamEvent mapping.
+                                if let Some(ref tx) = event_tx {
+                                    if let Some(ae) = map_to_anthropic_event(&evt) {
+                                        let _ = tx.send(QueryEvent::Stream(ae));
                                     }
-                                    Some(Ok(evt)) => {
-                                        // Forward to TUI via AnthropicStreamEvent mapping.
-                                        if let Some(ref tx) = event_tx {
-                                            if let Some(ae) = map_to_anthropic_event(&evt) {
-                                                let _ = tx.send(QueryEvent::Stream(ae));
-                                            }
-                                        }
+                                }
 
-                                        // Accumulate response data.
-                                        match &evt {
-                                            claurst_api::StreamEvent::MessageStart { id, usage: u, .. } => {
-                                                msg_id = id.clone();
-                                                usage.input_tokens = u.input_tokens;
-                                                usage.cache_read_input_tokens = u.cache_read_input_tokens;
-                                                usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
-                                            }
-                                            claurst_api::StreamEvent::ContentBlockStart { index, content_block } => {
-                                                if let ContentBlock::ToolUse { id, name, .. } = content_block {
-                                                    tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new()));
-                                                }
-                                            }
-                                            claurst_api::StreamEvent::TextDelta { text, .. } => {
-                                                text_chunks.push(text.clone());
-                                            }
-                                            claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
-                                                if let Some((_, _, buf)) = tool_call_blocks.get_mut(index) {
-                                                    buf.push_str(partial_json);
-                                                }
-                                            }
-                                            claurst_api::StreamEvent::MessageDelta { stop_reason, usage: u } => {
-                                                stop_str = match stop_reason {
-                                                    Some(claurst_api::provider_types::StopReason::ToolUse) => "tool_use",
-                                                    Some(claurst_api::provider_types::StopReason::MaxTokens) => "max_tokens",
-                                                    _ => "end_turn",
-                                                }.to_string();
-                                                if let Some(u) = u {
-                                                    usage.output_tokens = u.output_tokens;
-                                                }
-                                            }
-                                            claurst_api::StreamEvent::MessageStop => break,
-                                            _ => {}
+                                // Accumulate response data.
+                                match &evt {
+                                    claurst_api::StreamEvent::MessageStart { id, usage: u, .. } => {
+                                        msg_id = id.clone();
+                                        usage.input_tokens = u.input_tokens;
+                                        usage.cache_read_input_tokens = u.cache_read_input_tokens;
+                                        usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
+                                    }
+                                    claurst_api::StreamEvent::ContentBlockStart { index, content_block } => {
+                                        if let ContentBlock::ToolUse { id, name, .. } = content_block {
+                                            tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new()));
                                         }
                                     }
+                                    claurst_api::StreamEvent::TextDelta { text, .. } => {
+                                        text_chunks.push(text.clone());
+                                    }
+                                    claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
+                                        if let Some((_, _, buf)) = tool_call_blocks.get_mut(index) {
+                                            buf.push_str(partial_json);
+                                        }
+                                    }
+                                    claurst_api::StreamEvent::MessageDelta { stop_reason, usage: u } => {
+                                        stop_str = match stop_reason {
+                                            Some(claurst_api::provider_types::StopReason::ToolUse) => "tool_use",
+                                            Some(claurst_api::provider_types::StopReason::MaxTokens) => "max_tokens",
+                                            _ => "end_turn",
+                                        }.to_string();
+                                        if let Some(u) = u {
+                                            usage.output_tokens = u.output_tokens;
+                                        }
+                                    }
+                                    claurst_api::StreamEvent::MessageStop => break,
+                                    _ => {}
                                 }
                             }
                         }
                     }
-
-                    // If the stream stalled (no data for 45s), retry.
-                    if provider_stream_stalled && retries_left > 0 {
-                        retries_left -= 1;
-                        warn!(provider = %provider_id_str, model = %model_id_str, retries_left, "Provider stream stalled — retrying");
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx.send(QueryEvent::Status(format!(
-                                "No response for 45s — retrying ({} left)…",
-                                retries_left + 1
-                            )));
-                        }
-                        turn -= 1;
-                        continue;
-                    }
-
-                    // Build the content blocks from accumulated stream data.
-                    let mut content_blocks: Vec<ContentBlock> = Vec::new();
-
-                    let combined_text = text_chunks.join("");
-                    if !combined_text.is_empty() {
-                        content_blocks.push(ContentBlock::Text { text: combined_text });
-                    }
-
-                    // Reconstruct tool-use blocks (sorted by index for determinism).
-                    let mut tc_indices: Vec<usize> = tool_call_blocks.keys().cloned().collect();
-                    tc_indices.sort();
-                    for idx in tc_indices {
-                        if let Some((id, name, json_str)) = tool_call_blocks.remove(&idx) {
-                            let input: serde_json::Value = serde_json::from_str(&json_str)
-                                .unwrap_or(serde_json::json!({}));
-                            content_blocks.push(ContentBlock::ToolUse { id, name, input });
-                        }
-                    }
-
-                    let assistant_msg = Message {
-                        role: claurst_core::types::Role::Assistant,
-                        content: claurst_core::types::MessageContent::Blocks(content_blocks.clone()),
-                        uuid: Some(msg_id),
-                        cost: None,
-                    };
-
-                    cost_tracker.add_usage(
-                        usage.input_tokens,
-                        usage.output_tokens,
-                        usage.cache_creation_input_tokens,
-                        usage.cache_read_input_tokens,
-                    );
-
-                    messages.push(assistant_msg.clone());
-
-                    // Handle tool-use turn: execute tools and loop.
-                    let tool_use_blocks: Vec<_> = content_blocks.iter().filter_map(|b| {
-                        if let ContentBlock::ToolUse { id, name, input } = b {
-                            Some((id.clone(), name.clone(), input.clone()))
-                        } else {
-                            None
-                        }
-                    }).collect();
-
-                    // Execute tools if any tool_use blocks were returned.
-                    // Note: we check the blocks themselves rather than relying
-                    // solely on stop_str == "tool_use" because many OpenAI-
-                    // compatible providers (Ollama, LM Studio, etc.) return
-                    // finish_reason "stop" even when tool calls are present.
-                    if !tool_use_blocks.is_empty() {
-                        let mut tool_results = Vec::new();
-                        for (tool_id, tool_name, tool_input) in tool_use_blocks {
-                            // Notify TUI that a tool is starting (matches Anthropic path).
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx.send(QueryEvent::ToolStart {
-                                    tool_name: tool_name.clone(),
-                                    tool_id: tool_id.clone(),
-                                    input_json: tool_input.to_string(),
-                                });
-                            }
-                            let result = execute_tool(&*tool_name, &tool_input, tools, &tool_ctx).await;
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx.send(QueryEvent::ToolEnd {
-                                    tool_name: tool_name.clone(),
-                                    tool_id: tool_id.clone(),
-                                    result: result.content.clone(),
-                                    is_error: result.is_error,
-                                });
-                            }
-                            tool_results.push(ContentBlock::ToolResult {
-                                tool_use_id: tool_id,
-                                content: claurst_core::types::ToolResultContent::Text(result.content),
-                                is_error: Some(result.is_error),
-                            });
-                        }
-                        messages.push(Message {
-                            role: claurst_core::types::Role::User,
-                            content: claurst_core::types::MessageContent::Blocks(tool_results),
-                            uuid: None,
-                            cost: None,
-                        });
-                        continue; // loop for next turn
-                    }
-
-                    // End turn — notify TUI and return.
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::TurnComplete {
-                            stop_reason: stop_str.clone(),
-                            turn,
-                            usage: Some(usage.clone()),
-                        });
-                    }
-
-                    return QueryOutcome::EndTurn {
-                        message: assistant_msg,
-                        usage,
-                    };
-                } else if provider_id_str != "anthropic" {
-                    // Non-Anthropic provider detected but no API key / credentials
-                    // available.  Return a clear error instead of silently falling
-                    // through to the Anthropic client.
-                    let hint = match provider_id_str.as_str() {
-                        "google" => "Set GOOGLE_API_KEY or run `claurst auth login --provider google`.",
-                        "openai" => "Set OPENAI_API_KEY or run `claurst auth login --provider openai`.",
-                        "groq" => "Set GROQ_API_KEY.",
-                        "mistral" => "Set MISTRAL_API_KEY.",
-                        "deepseek" => "Set DEEPSEEK_API_KEY.",
-                        "xai" => "Set XAI_API_KEY.",
-                        "github-copilot" => "Reconnect GitHub Copilot via /connect, or set GITHUB_TOKEN.",
-                        "cohere" => "Set COHERE_API_KEY.",
-                        _ => "Set the appropriate API key environment variable or use `claurst auth login`.",
-                    };
-                    error!(
-                        provider = %provider_id_str,
-                        model = %model_id_str,
-                        "No credentials found for provider"
-                    );
-                    return QueryOutcome::Error(
-                        ClaudeError::Api(format!(
-                            "No API key for provider '{}' (model '{}'). {}",
-                            provider_id_str, model_id_str, hint
-                        ))
-                    );
                 }
-                // Anthropic with no auth_store key: fall through to the raw
-                // client path below (which has its own deferred key validation
-                // with detailed model-specific hints).
             }
+
+            // If the stream stalled (no data for 45s), retry.
+            if provider_stream_stalled && retries_left > 0 {
+                retries_left -= 1;
+                warn!(provider = %target.provider_id, model = %target.model_id, retries_left, "Provider stream stalled — retrying");
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Status(format!(
+                        "No response for 45s — retrying ({} left)…",
+                        retries_left + 1
+                    )));
+                }
+                turn -= 1;
+                continue;
+            }
+
+            // Build the content blocks from accumulated stream data.
+            let mut content_blocks: Vec<ContentBlock> = Vec::new();
+
+            let combined_text = text_chunks.join("");
+            if !combined_text.is_empty() {
+                content_blocks.push(ContentBlock::Text { text: combined_text });
+            }
+
+            // Reconstruct tool-use blocks (sorted by index for determinism).
+            let mut tc_indices: Vec<usize> = tool_call_blocks.keys().cloned().collect();
+            tc_indices.sort();
+            for idx in tc_indices {
+                if let Some((id, name, json_str)) = tool_call_blocks.remove(&idx) {
+                    let input: serde_json::Value = serde_json::from_str(&json_str)
+                        .unwrap_or(serde_json::json!({}));
+                    content_blocks.push(ContentBlock::ToolUse { id, name, input });
+                }
+            }
+
+            let assistant_msg = Message {
+                role: claurst_core::types::Role::Assistant,
+                content: claurst_core::types::MessageContent::Blocks(content_blocks.clone()),
+                uuid: Some(msg_id),
+                cost: None,
+            };
+
+            cost_tracker.add_usage(
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_input_tokens,
+                usage.cache_read_input_tokens,
+            );
+
+            messages.push(assistant_msg.clone());
+
+            // Handle tool-use turn: execute tools and loop.
+            let tool_use_blocks: Vec<_> = content_blocks.iter().filter_map(|b| {
+                if let ContentBlock::ToolUse { id, name, input } = b {
+                    Some((id.clone(), name.clone(), input.clone()))
+                } else {
+                    None
+                }
+            }).collect();
+
+            // Execute tools if any tool_use blocks were returned.
+            // Note: we check the blocks themselves rather than relying
+            // solely on stop_str == "tool_use" because many OpenAI-
+            // compatible providers (Ollama, LM Studio, etc.) return
+            // finish_reason "stop" even when tool calls are present.
+            if !tool_use_blocks.is_empty() {
+                let mut tool_results = Vec::new();
+                for (tool_id, tool_name, tool_input) in tool_use_blocks {
+                    // Notify TUI that a tool is starting (matches Anthropic path).
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::ToolStart {
+                            tool_name: tool_name.clone(),
+                            tool_id: tool_id.clone(),
+                            input_json: tool_input.to_string(),
+                        });
+                    }
+                    let result = execute_tool(&*tool_name, &tool_input, tools, &tool_ctx).await;
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::ToolEnd {
+                            tool_name: tool_name.clone(),
+                            tool_id: tool_id.clone(),
+                            result: result.content.clone(),
+                            is_error: result.is_error,
+                        });
+                    }
+                    tool_results.push(ContentBlock::ToolResult {
+                        tool_use_id: tool_id,
+                        content: claurst_core::types::ToolResultContent::Text(result.content),
+                        is_error: Some(result.is_error),
+                    });
+                }
+                messages.push(Message {
+                    role: claurst_core::types::Role::User,
+                    content: claurst_core::types::MessageContent::Blocks(tool_results),
+                    uuid: None,
+                    cost: None,
+                });
+                continue; // loop for next turn
+            }
+
+            // End turn — notify TUI and return.
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::TurnComplete {
+                    stop_reason: stop_str.clone(),
+                    turn,
+                    usage: Some(usage.clone()),
+                });
+            }
+
+            return QueryOutcome::EndTurn {
+                message: assistant_msg,
+                usage,
+            };
         }
 
         // Send to API
