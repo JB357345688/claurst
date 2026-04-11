@@ -16,11 +16,13 @@ pub mod compact;
 pub mod context_analyzer;
 pub mod coordinator;
 pub mod cron_scheduler;
+pub mod provider_resolution;
 pub mod session_memory;
 pub mod skill_prefetch;
 pub use agent_tool::{AgentTool, init_team_swarm_runner};
 pub use command_queue::{CommandPriority, CommandQueue, QueuedCommand, drain_command_queue};
 pub use cron_scheduler::start_cron_scheduler;
+pub use provider_resolution::*;
 pub use skill_prefetch::{
     SkillDefinition, SkillIndex, SharedSkillIndex, prefetch_skills, format_skill_listing,
 };
