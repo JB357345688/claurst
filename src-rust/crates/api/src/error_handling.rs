@@ -129,6 +129,21 @@ pub fn parse_error_response(status: u16, body: &str, provider: &ProviderId) -> P
         }
     }
 
+    if is_ollama_endpoint_shape_404(status, provider, &message, body) {
+        let endpoint_message = json
+            .as_ref()
+            .and_then(|j| j.pointer("/error").and_then(|v| v.as_str()))
+            .unwrap_or(message.as_str())
+            .to_string();
+
+        return ProviderError::Other {
+            provider: provider.clone(),
+            message: endpoint_message,
+            status: Some(status),
+            body: Some(body.to_string()),
+        };
+    }
+
     // Classify by HTTP status code.
     match status {
         401 | 403 => ProviderError::AuthFailed {
@@ -162,6 +177,22 @@ pub fn parse_error_response(status: u16, body: &str, provider: &ProviderId) -> P
             body: Some(body.to_string()),
         },
     }
+}
+
+fn is_ollama_endpoint_shape_404(
+    status: u16,
+    provider: &ProviderId,
+    message: &str,
+    body: &str,
+) -> bool {
+    if status != 404 || provider != ProviderId::OLLAMA {
+        return false;
+    }
+
+    let combined = format!("{message}\n{body}").to_lowercase();
+    combined.contains("path")
+        && combined.contains("not found")
+        && (combined.contains("/chat/completions") || combined.contains("/models"))
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +345,35 @@ mod tests {
         let pid = ProviderId::new("openai");
         let err = parse_error_response(429, "rate limited", &pid);
         assert!(matches!(err, ProviderError::RateLimited { .. }));
+    }
+
+    #[test]
+    fn test_parse_error_response_ollama_endpoint_shape_404_is_not_model_not_found() {
+        let pid = ProviderId::new("ollama");
+        let raw_body = r#"{"error":"path \"/api/v1/chat/completions\" not found"}"#;
+        let err = parse_error_response(404, raw_body, &pid);
+
+        match err {
+            ProviderError::Other {
+                status,
+                message,
+                body,
+                ..
+            } => {
+                assert_eq!(status, Some(404));
+                assert!(message.contains("/api/v1/chat/completions"));
+                assert_eq!(body.as_deref(), Some(raw_body));
+            }
+            other => panic!("expected ProviderError::Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_error_response_non_ollama_404_stays_model_not_found() {
+        let pid = ProviderId::new("openai");
+        let body = r#"{"error":"path \"/api/v1/chat/completions\" not found"}"#;
+        let err = parse_error_response(404, body, &pid);
+        assert!(matches!(err, ProviderError::ModelNotFound { .. }));
     }
 
     #[test]

@@ -77,10 +77,7 @@ impl AuthStore {
         self.save();
     }
 
-    /// Get the API key for a provider, checking stored credentials first then
-    /// falling back to the relevant environment variable.
-    pub fn api_key_for(&self, provider_id: &str) -> Option<String> {
-        // Check stored credentials first
+    fn stored_api_key_for(&self, provider_id: &str) -> Option<String> {
         if let Some(stored) = self.get(provider_id) {
             match stored {
                 StoredCredential::ApiKey { key } => {
@@ -103,8 +100,11 @@ impl AuthStore {
                 _ => {}
             }
         }
-        // Fall back to environment variable
-        let env_var = match provider_id {
+        None
+    }
+
+    fn env_var_for(provider_id: &str) -> Option<&'static str> {
+        match provider_id {
             "anthropic" => "ANTHROPIC_API_KEY",
             "openai" => "OPENAI_API_KEY",
             "google" => "GOOGLE_API_KEY",
@@ -116,6 +116,7 @@ impl AuthStore {
             "openrouter" => "OPENROUTER_API_KEY",
             "togetherai" | "together-ai" => "TOGETHER_API_KEY",
             "perplexity" => "PERPLEXITY_API_KEY",
+            "ollama" => "OLLAMA_API_KEY",
             "cohere" => "COHERE_API_KEY",
             "deepinfra" => "DEEPINFRA_API_KEY",
             "venice" => "VENICE_API_KEY",
@@ -124,14 +125,63 @@ impl AuthStore {
             "huggingface" => "HF_TOKEN",
             "nvidia" => "NVIDIA_API_KEY",
             _ => return None,
-        };
+        }
+        .into()
+    }
+
+    fn env_api_key_for(provider_id: &str) -> Option<String> {
+        let env_var = Self::env_var_for(provider_id)?;
         std::env::var(env_var).ok().filter(|k| !k.is_empty())
+    }
+
+    /// Get the API key for a provider using provider-specific precedence
+    /// between environment variables and stored credentials.
+    pub fn api_key_for(&self, provider_id: &str) -> Option<String> {
+        if provider_id == "ollama" {
+            return Self::env_api_key_for(provider_id)
+                .or_else(|| self.stored_api_key_for(provider_id));
+        }
+
+        self.stored_api_key_for(provider_id)
+            .or_else(|| Self::env_api_key_for(provider_id))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AuthStore, StoredCredential};
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn github_copilot_oauth_prefers_refresh_token() {
@@ -162,5 +212,40 @@ mod tests {
         );
 
         assert_eq!(store.api_key_for("openrouter").as_deref(), Some("or-key"));
+    }
+
+    #[test]
+    fn ollama_api_key_prefers_env_over_stored_key() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::set("OLLAMA_API_KEY", Some("env-key"));
+
+        let mut store = AuthStore::default();
+        store.credentials.insert(
+            "ollama".to_string(),
+            StoredCredential::ApiKey {
+                key: "stored-key".to_string(),
+            },
+        );
+
+        assert_eq!(store.api_key_for("ollama").as_deref(), Some("env-key"));
+    }
+
+    #[test]
+    fn ollama_api_key_falls_back_to_stored_key_when_env_is_empty() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::set("OLLAMA_API_KEY", Some(""));
+
+        let mut store = AuthStore::default();
+        store.credentials.insert(
+            "ollama".to_string(),
+            StoredCredential::ApiKey {
+                key: "stored-key".to_string(),
+            },
+        );
+
+        assert_eq!(
+            store.api_key_for("ollama").as_deref(),
+            Some("stored-key")
+        );
     }
 }

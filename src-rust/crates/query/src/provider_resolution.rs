@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use claurst_api::{LlmProvider, ModelRegistry, ProviderRegistry};
-use claurst_core::{ProviderId, config::ProviderConfig};
+use claurst_core::{AuthStore, ProviderId, config::ProviderConfig};
 
 pub const KNOWN_PROVIDERS: &[&str] = &[
     "anthropic",
@@ -159,6 +159,15 @@ pub fn materialize_provider(
     registry: &ProviderRegistry,
     provider_configs: &HashMap<String, ProviderConfig>,
 ) -> Result<ExecutionTarget, ProviderResolutionError> {
+    if identity.provider_id == ProviderId::OLLAMA {
+        return Ok(ExecutionTarget {
+            provider_id: identity.provider_id.clone(),
+            model_id: identity.model_id.clone(),
+            provider: Arc::new(build_ollama_provider(provider_configs)),
+            resolution_source: identity.resolution_source.clone(),
+        });
+    }
+
     let pid = ProviderId::new(&identity.provider_id);
 
     let runtime_provider = claurst_api::registry::runtime_provider_for(&identity.provider_id);
@@ -204,4 +213,82 @@ pub fn materialize_provider(
         provider,
         resolution_source: identity.resolution_source.clone(),
     })
+}
+
+fn build_ollama_provider(
+    provider_configs: &HashMap<String, ProviderConfig>,
+) -> claurst_api::providers::openai_compat::OpenAiCompatProvider {
+    let mut provider = claurst_api::providers::openai_compat_providers::ollama();
+
+    if let Some(override_base) = provider_configs
+        .get(ProviderId::OLLAMA)
+        .and_then(|pc| pc.api_base.as_deref())
+    {
+        provider = provider.with_base_url(normalize_ollama_api_base(override_base));
+    }
+
+    if let Some(key) = AuthStore::load().api_key_for(ProviderId::OLLAMA) {
+        provider = provider.with_api_key(key);
+    }
+
+    provider
+}
+
+fn normalize_ollama_api_base(api_base: &str) -> String {
+    let trimmed = api_base.trim_end_matches('/');
+
+    if let Some(root) = trimmed.strip_suffix("/api/v1") {
+        return format!("{root}/v1");
+    }
+
+    if let Some(root) = trimmed.strip_suffix("/api") {
+        return format!("{root}/v1");
+    }
+
+    if trimmed.ends_with("/v1") {
+        return trimmed.to_string();
+    }
+
+    format!("{trimmed}/v1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_ollama_api_base;
+
+    #[test]
+    fn normalize_ollama_api_base_rewrites_hosted_api_root() {
+        assert_eq!(
+            normalize_ollama_api_base("https://ollama.com/api"),
+            "https://ollama.com/v1"
+        );
+        assert_eq!(
+            normalize_ollama_api_base("https://ollama.com/api/"),
+            "https://ollama.com/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_ollama_api_base_rewrites_hosted_api_v1_root() {
+        assert_eq!(
+            normalize_ollama_api_base("https://ollama.com/api/v1"),
+            "https://ollama.com/v1"
+        );
+        assert_eq!(
+            normalize_ollama_api_base("https://ollama.com/api/v1/"),
+            "https://ollama.com/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_ollama_api_base_appends_v1_for_plain_roots() {
+        assert_eq!(
+            normalize_ollama_api_base("http://localhost:11434"),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            normalize_ollama_api_base("https://ollama.com/v1"),
+            "https://ollama.com/v1"
+        );
+    }
 }
