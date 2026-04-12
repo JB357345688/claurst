@@ -160,10 +160,11 @@ fn system_message_preserves_text() {
 
 #[test]
 fn thinking_block_collapsed() {
-    let lines = render_thinking_block("hidden thoughts", false);
+    let lines = render_thinking_block("Planning next step\nhidden thoughts", false);
     assert_eq!(lines.len(), 1);
     let text = flatten(&lines);
     assert!(text.contains("Thinking"));
+    assert!(text.contains("Planning next step"));
     assert!(!text.contains("hidden thoughts"));
 }
 
