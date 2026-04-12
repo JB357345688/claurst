@@ -30,6 +30,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::provider_resolution::{materialize_provider, resolve_provider_identity, KNOWN_PROVIDERS};
 use crate::{run_query_loop, QueryConfig, QueryOutcome};
 
 // ---------------------------------------------------------------------------
@@ -233,28 +234,6 @@ impl Tool for AgentTool {
 
         info!(description = %params.description, "Spawning sub-agent");
 
-        // Resolve API key from environment.
-        let api_key = match std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-        {
-            Some(k) => k,
-            None => {
-                return ToolResult::error(
-                    "ANTHROPIC_API_KEY not set - cannot spawn sub-agent".to_string(),
-                )
-            }
-        };
-
-        // Dedicated Anthropic client for the sub-agent.
-        let client = match AnthropicClient::new(ClientConfig {
-            api_key,
-            ..Default::default()
-        }) {
-            Ok(c) => Arc::new(c),
-            Err(e) => return ToolResult::error(format!("Failed to create client: {}", e)),
-        };
-
         // Build the tool list for the sub-agent.
         // Always exclude AgentTool itself to prevent unbounded recursion.
         let all = claurst_tools::all_tools();
@@ -273,6 +252,71 @@ impl Tool for AgentTool {
             .model
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| claurst_core::constants::DEFAULT_MODEL.to_string());
+
+        let explicit_provider = params.provider.as_deref().filter(|p| !p.is_empty());
+        let parent_provider = ctx.config.provider.as_deref().filter(|p| !p.is_empty());
+        let model_has_provider_prefix = matches!(
+            model.split_once('/'),
+            Some((provider_id, _)) if KNOWN_PROVIDERS.contains(&provider_id)
+        );
+        let provider_hint = if explicit_provider.is_some() {
+            explicit_provider
+        } else if model_has_provider_prefix {
+            None
+        } else {
+            parent_provider
+        };
+
+        let registry = match ctx.provider_registry.as_ref() {
+            Some(registry) => registry,
+            None => {
+                return ToolResult::error(
+                    "Cannot spawn sub-agent: provider_registry not available in ToolContext"
+                        .to_string(),
+                )
+            }
+        };
+
+        let identity = match resolve_provider_identity(provider_hint, &model, ctx.model_registry.as_deref()) {
+            Ok(identity) => identity,
+            Err(e) => return ToolResult::error(format!("Provider resolution failed: {}", e)),
+        };
+
+        let target = match materialize_provider(&identity, registry, &ctx.config.provider_configs) {
+            Ok(target) => target,
+            Err(e) => return ToolResult::error(format!("Provider materialization failed: {}", e)),
+        };
+
+        let client_config = if target.provider_id == "anthropic" {
+            let (api_key, use_bearer_auth) = match ctx
+                .config
+                .resolve_auth_async()
+                .await
+                .or_else(|| claurst_core::AuthStore::load().api_key_for("anthropic").map(|key| (key, false)))
+            {
+                Some(auth) => auth,
+                None => {
+                    return ToolResult::error(
+                        "No Anthropic credentials available for foreground sub-agent client"
+                            .to_string(),
+                    )
+                }
+            };
+
+            ClientConfig {
+                api_key,
+                api_base: ctx.config.resolve_api_base(),
+                use_bearer_auth,
+                ..Default::default()
+            }
+        } else {
+            ClientConfig::default()
+        };
+
+        let client = match AnthropicClient::new(client_config) {
+            Ok(client) => Arc::new(client),
+            Err(e) => return ToolResult::error(format!("Failed to create client: {}", e)),
+        };
 
         let system_prompt = params.system_prompt.unwrap_or_else(|| {
             let mut prompt = "You are a specialized AI agent helping with a specific sub-task. \
@@ -342,7 +386,7 @@ impl Tool for AgentTool {
             };
 
         let query_config = QueryConfig {
-            model,
+            model: target.model_id.clone(),
             max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
             max_turns: params.max_turns.unwrap_or(10),
             system_prompt: Some(system_prompt),
@@ -358,11 +402,14 @@ impl Tool for AgentTool {
             skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
-            provider_registry: None,
+            provider_registry: Some(registry.clone()),
             agent_name: None,
             agent_definition: None,
-            model_registry: None,
+            model_registry: ctx.model_registry.clone(),
         };
+
+        let mut foreground_ctx = ctx.clone();
+        foreground_ctx.config.provider = Some(target.provider_id.clone());
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
         // -----------------------------------------------------------------------
@@ -437,7 +484,7 @@ impl Tool for AgentTool {
             client.as_ref(),
             &mut messages,
             &agent_tools,
-            ctx,
+            &foreground_ctx,
             &query_config,
             ctx.cost_tracker.clone(),
             None, // no event forwarding for sub-agents
