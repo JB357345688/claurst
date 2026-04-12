@@ -569,41 +569,29 @@ fn format_outcome(outcome: QueryOutcome) -> String {
 /// Panics if the runner was already registered.
 pub fn init_team_swarm_runner() {
     let runner: claurst_tools::AgentRunFn = Arc::new(
-        |description: String,
-         prompt: String,
-         tools: Option<Vec<String>>,
-         system: Option<String>,
-         max_turns: Option<u32>,
-         ctx: Arc<claurst_tools::ToolContext>| {
+        |params: claurst_tools::team_tool::AgentRunParams| {
             // We must return a Pin<Box<dyn Future<...> + Send>>.
             Box::pin(async move {
-                // Resolve API key.
-                let api_key = match std::env::var("ANTHROPIC_API_KEY")
-                    .ok()
-                    .filter(|k| !k.is_empty())
-                {
-                    Some(k) => k,
+                let claurst_tools::team_tool::AgentRunParams {
+                    description,
+                    prompt,
+                    tools,
+                    system_prompt,
+                    max_turns,
+                    ctx,
+                    provider_override,
+                    model_override,
+                } = params;
+
+                let registry = match ctx.provider_registry.clone() {
+                    Some(registry) => registry,
                     None => {
                         return format!(
-                            "[Agent '{}' failed: ANTHROPIC_API_KEY not set]",
+                            "[Agent '{}' failed: provider_registry not available in ToolContext]",
                             description
                         )
                     }
                 };
-
-                let client =
-                    match claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
-                        api_key,
-                        ..Default::default()
-                    }) {
-                        Ok(c) => Arc::new(c),
-                        Err(e) => {
-                            return format!(
-                                "[Agent '{}' failed to create client: {}]",
-                                description, e
-                            )
-                        }
-                    };
 
                 // Build the tool list, filtering to the allowlist if provided.
                 let all = claurst_tools::all_tools();
@@ -618,32 +606,100 @@ pub fn init_team_swarm_runner() {
                             .collect()
                     };
 
-                let model = claurst_core::constants::DEFAULT_MODEL.to_string();
+                let model = model_override
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| claurst_core::constants::DEFAULT_MODEL.to_string());
 
-                let system_prompt = system.unwrap_or_else(|| {
+                let identity = match resolve_provider_identity(
+                    provider_override.as_deref().filter(|p| !p.is_empty()),
+                    &model,
+                    ctx.model_registry.as_deref(),
+                ) {
+                    Ok(identity) => identity,
+                    Err(e) => {
+                        return format!(
+                            "[Agent '{}' provider resolution failed: {}]",
+                            description, e
+                        )
+                    }
+                };
+
+                let target = match materialize_provider(&identity, &registry, &ctx.config.provider_configs)
+                {
+                    Ok(target) => target,
+                    Err(e) => {
+                        return format!(
+                            "[Agent '{}' provider materialization failed: {}]",
+                            description, e
+                        )
+                    }
+                };
+
+                let client_config = if target.provider_id == "anthropic" {
+                    let (api_key, use_bearer_auth) = match ctx
+                        .config
+                        .resolve_auth_async()
+                        .await
+                        .or_else(|| {
+                            claurst_core::AuthStore::load()
+                                .api_key_for("anthropic")
+                                .map(|key| (key, false))
+                        }) {
+                        Some(auth) => auth,
+                        None => {
+                            return format!(
+                                "[Agent '{}' failed: no Anthropic credentials available for runner client]",
+                                description
+                            )
+                        }
+                    };
+
+                    ClientConfig {
+                        api_key,
+                        api_base: ctx.config.resolve_api_base(),
+                        use_bearer_auth,
+                        ..Default::default()
+                    }
+                } else {
+                    ClientConfig::default()
+                };
+
+                let client = match AnthropicClient::new(client_config) {
+                    Ok(client) => Arc::new(client),
+                    Err(e) => {
+                        return format!("[Agent '{}' failed to create client: {}]", description, e)
+                    }
+                };
+
+                let system_prompt = system_prompt.unwrap_or_else(|| {
                     "You are a specialized AI agent helping with a specific sub-task. \
                      Complete the task thoroughly and return your findings."
                         .to_string()
                 });
 
-                let query_config = crate::QueryConfig {
-                    model,
+                let query_config = QueryConfig {
+                    model: target.model_id.clone(),
                     max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
                     max_turns: max_turns.unwrap_or(10),
                     system_prompt: Some(system_prompt),
                     working_directory: Some(ctx.working_dir.display().to_string()),
                     output_style: ctx.config.effective_output_style(),
                     output_style_prompt: ctx.config.resolve_output_style_prompt(),
+                    provider_registry: Some(registry.clone()),
+                    model_registry: ctx.model_registry.clone(),
                     ..Default::default()
                 };
 
+                let mut runner_ctx = (*ctx).clone();
+                runner_ctx.config.provider = Some(target.provider_id.clone());
+
                 let cancel = tokio_util::sync::CancellationToken::new();
-                let mut messages = vec![claurst_core::types::Message::user(prompt)];
-                let outcome = crate::run_query_loop(
+                let mut messages = vec![Message::user(prompt)];
+                let outcome = run_query_loop(
                     client.as_ref(),
                     &mut messages,
                     &agent_tools,
-                    &ctx,
+                    &runner_ctx,
                     &query_config,
                     ctx.cost_tracker.clone(),
                     None,
