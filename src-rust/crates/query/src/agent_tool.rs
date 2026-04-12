@@ -424,7 +424,7 @@ impl Tool for AgentTool {
                 .collect();
 
             let client_bg = client.clone();
-            let ctx_bg = ctx.clone();
+            let ctx_bg = foreground_ctx.clone();
             let config_bg = query_config.clone();
             let cost_tracker_bg = ctx.cost_tracker.clone();
             let description_bg = params.description.clone();
