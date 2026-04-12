@@ -227,6 +227,11 @@ pub struct ToolContext {
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     /// Configured event hooks (PreToolUse, PostToolUse, etc.).
     pub config: claurst_core::config::Config,
+    /// Optional provider registry for multi-provider dispatch.
+    /// Populated by the CLI from the root session's registry.
+    pub provider_registry: Option<Arc<claurst_api::ProviderRegistry>>,
+    /// Optional model registry for dynamic model->provider resolution.
+    pub model_registry: Option<Arc<claurst_api::ModelRegistry>>,
 }
 
 impl ToolContext {
@@ -549,6 +554,8 @@ mod tests {
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),
+            provider_registry: None,
+            model_registry: None,
         };
 
         // Absolute paths pass through unchanged
@@ -577,6 +584,8 @@ mod tests {
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),
+            provider_registry: None,
+            model_registry: None,
         };
 
         // Relative paths get joined with working_dir

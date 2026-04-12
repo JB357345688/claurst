@@ -659,6 +659,8 @@ async fn main() -> anyhow::Result<()> {
         non_interactive: cli.print || cli.prompt.is_some(),
         mcp_manager: mcp_manager_arc.clone(),
         config: config.clone(),
+        provider_registry: None,
+        model_registry: None,
     };
 
     // Register the cc-query-backed agent runner so TeamCreateTool can spawn real
