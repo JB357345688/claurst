@@ -648,21 +648,6 @@ async fn main() -> anyhow::Result<()> {
     // Initialize MCP servers first (needed for ToolContext.mcp_manager).
     let mcp_manager_arc = connect_mcp_manager_arc(&config).await;
 
-    let tool_ctx = ToolContext {
-        working_dir: cwd.clone(),
-        permission_mode: config.permission_mode.clone(),
-        permission_handler: permission_handler.clone(),
-        cost_tracker: cost_tracker.clone(),
-        session_id: session_id.clone(),
-        file_history: file_history.clone(),
-        current_turn: current_turn.clone(),
-        non_interactive: cli.print || cli.prompt.is_some(),
-        mcp_manager: mcp_manager_arc.clone(),
-        config: config.clone(),
-        provider_registry: None,
-        model_registry: None,
-    };
-
     // Register the cc-query-backed agent runner so TeamCreateTool can spawn real
     // sub-agents.  Must be called before any tool execution begins.
     // The function is idempotent if already registered (panics only on double-call,
@@ -740,6 +725,21 @@ async fn main() -> anyhow::Result<()> {
     // Wire in the provider registry so non-Anthropic providers can be dispatched.
     let provider_registry = std::sync::Arc::new(provider_registry);
     query_config.provider_registry = Some(provider_registry.clone());
+
+    let tool_ctx = ToolContext {
+        working_dir: cwd.clone(),
+        permission_mode: config.permission_mode.clone(),
+        permission_handler: permission_handler.clone(),
+        cost_tracker: cost_tracker.clone(),
+        session_id: session_id.clone(),
+        file_history: file_history.clone(),
+        current_turn: current_turn.clone(),
+        non_interactive: cli.print || cli.prompt.is_some(),
+        mcp_manager: mcp_manager_arc.clone(),
+        config: config.clone(),
+        provider_registry: Some(provider_registry.clone()),
+        model_registry: Some(model_registry.clone()),
+    };
 
     // Wire in the named agent (--agent flag).
     // Merge built-in default agents with user-defined agents (user wins on collision).
