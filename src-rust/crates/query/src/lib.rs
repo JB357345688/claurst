@@ -1131,6 +1131,93 @@ pub async fn run_query_loop(
 
             messages.push(assistant_msg.clone());
 
+            let provider_compaction_options = build_provider_options(
+                &target.provider_id,
+                &target.model_id,
+                config.effort_level,
+                effective_thinking_budget,
+            );
+            let reactive_compact_enabled =
+                claurst_core::feature_gates::is_feature_enabled("reactive_compact");
+
+            if reactive_compact_enabled {
+                let context_limit = compact::context_window_for_model(&target.model_id);
+                if compact::should_context_collapse(usage.input_tokens, context_limit) {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(
+                            "Compacting context... (emergency collapse)".to_string(),
+                        ));
+                    }
+                    match compact::context_collapse_with_provider(
+                        std::mem::take(messages),
+                        provider.as_ref(),
+                        &target.model_id,
+                        provider_compaction_options.clone(),
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            *messages = result.messages;
+                            info!(
+                                tokens_freed = result.tokens_freed,
+                                provider = %target.provider_id,
+                                "Context-collapse complete"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, provider = %target.provider_id, "Context-collapse failed");
+                        }
+                    }
+                } else if compact::should_compact(usage.input_tokens, context_limit) {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status("Compacting context...".to_string()));
+                    }
+                    match compact::reactive_compact_with_provider(
+                        std::mem::take(messages),
+                        provider.as_ref(),
+                        &target.model_id,
+                        provider_compaction_options.clone(),
+                        cancel_token.clone(),
+                        &[],
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            *messages = result.messages;
+                            info!(
+                                tokens_freed = result.tokens_freed,
+                                provider = %target.provider_id,
+                                "Reactive compact complete"
+                            );
+                        }
+                        Err(claurst_core::error::ClaudeError::Cancelled) => {
+                            warn!(provider = %target.provider_id, "Reactive compact was cancelled");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, provider = %target.provider_id, "Reactive compact failed");
+                        }
+                    }
+                }
+            } else if stop_str == "end_turn" || stop_str == "tool_use" {
+                if let Some(new_msgs) = compact::auto_compact_if_needed_with_provider(
+                    provider.as_ref(),
+                    messages,
+                    usage.input_tokens,
+                    &target.model_id,
+                    &mut compact_state,
+                    provider_compaction_options.clone(),
+                )
+                .await
+                {
+                    *messages = new_msgs;
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(
+                            "Context compacted to stay within limits.".to_string(),
+                        ));
+                    }
+                }
+            }
+
             // Handle tool-use turn: execute tools and loop.
             let tool_use_blocks: Vec<_> = content_blocks
                 .iter()

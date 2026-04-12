@@ -21,8 +21,8 @@
 //   full compaction and can fire proactively at 75 % capacity.
 
 use claurst_api::{
-    AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler,
-    SystemPrompt,
+    AnthropicStreamEvent, ApiMessage, CreateMessageRequest, LlmProvider, ProviderRequest,
+    StreamAccumulator, StreamHandler, SystemPrompt,
 };
 use claurst_core::error::ClaudeError;
 use claurst_core::types::{ContentBlock, Message, MessageContent, Role};
@@ -664,6 +664,137 @@ async fn summarise_head(
     Ok(new_messages)
 }
 
+async fn summarise_head_with_provider(
+    provider: &dyn LlmProvider,
+    messages: &[Message],
+    split_at: usize,
+    model: &str,
+    max_summary_tokens: u32,
+    provider_options: Value,
+) -> Result<Vec<Message>, ClaudeError> {
+    if split_at == 0 {
+        return Ok(messages.to_vec());
+    }
+
+    let head = &messages[..split_at];
+
+    // Build a transcript string for the summarisation prompt.
+    let mut transcript = String::new();
+    let original_count = head.len();
+    let original_token_estimate = estimate_tokens_for_messages(head);
+
+    for msg in head {
+        let role_label = match msg.role {
+            Role::User => "Human",
+            Role::Assistant => "Assistant",
+        };
+        let text = msg.get_all_text();
+        if !text.is_empty() {
+            transcript.push_str(&format!("{}: {}\n\n", role_label, text));
+        }
+        // Also render tool use/result blocks
+        if let MessageContent::Blocks(blocks) = &msg.content {
+            for block in blocks {
+                match block {
+                    ContentBlock::ToolUse { name, input, id } => {
+                        transcript.push_str(&format!(
+                            "[Tool Call: {} (id={})]\nInput: {}\n\n",
+                            name, id, input
+                        ));
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        let result_text = match content {
+                            claurst_core::types::ToolResultContent::Text(t) => {
+                                t.as_str().to_string()
+                            }
+                            claurst_core::types::ToolResultContent::Blocks(_) => {
+                                "[complex content]".to_string()
+                            }
+                        };
+                        let error_flag = if is_error.unwrap_or(false) {
+                            " [ERROR]"
+                        } else {
+                            ""
+                        };
+                        transcript.push_str(&format!(
+                            "[Tool Result (id={}){}]\n{}\n\n",
+                            tool_use_id, error_flag, result_text
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let compact_prompt = get_compact_prompt(None);
+
+    let user_content = format!(
+        "{}\n\n<conversation_to_summarize original_messages=\"{}\" estimated_tokens=\"{}\">\n{}\n</conversation_to_summarize>",
+        compact_prompt,
+        original_count,
+        original_token_estimate,
+        transcript
+    );
+
+    let request = ProviderRequest {
+        model: model.to_string(),
+        messages: vec![Message::user(user_content)],
+        system_prompt: Some(SystemPrompt::Text(
+            "You are a helpful assistant that creates concise yet thorough conversation summaries. \
+             Preserve all technical details, file names, code snippets, and decisions that would \
+             be important for continuing the work. Follow the structured format exactly."
+                .to_string(),
+        )),
+        tools: Vec::new(),
+        max_tokens: max_summary_tokens,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: Vec::new(),
+        thinking: None,
+        provider_options,
+    };
+
+    let response = provider.create_message(request).await?;
+    let raw_summary = response
+        .content
+        .iter()
+        .filter_map(|block| {
+            if let ContentBlock::Text { text } = block {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    if raw_summary.is_empty() {
+        return Err(ClaudeError::Other("Compact summary was empty".to_string()));
+    }
+
+    let formatted_summary = format_compact_summary(&raw_summary);
+
+    // Build the new conversation:
+    //   [user: compact summary preamble] [recent tail messages]
+    let compact_notice = Message::user(format!(
+        "This session is being continued from a previous conversation that ran out of context. \
+         The summary below covers the earlier portion of the conversation (originally {} messages, \
+         ~{} tokens).\n\n{}",
+        original_count, original_token_estimate, formatted_summary
+    ));
+
+    let mut new_messages = vec![compact_notice];
+    new_messages.extend_from_slice(&messages[split_at..]);
+
+    Ok(new_messages)
+}
+
 /// Compact `messages` in-place, replacing the head with a summary.
 /// Returns the new messages vector on success.
 pub async fn compact_conversation(
@@ -692,6 +823,32 @@ pub async fn compact_conversation(
     summarise_head(client, messages, split_at, model, 20_000).await
 }
 
+pub async fn compact_conversation_with_provider(
+    provider: &dyn LlmProvider,
+    messages: &[Message],
+    model: &str,
+    provider_options: Value,
+) -> Result<Vec<Message>, ClaudeError> {
+    let total = messages.len();
+
+    if total <= KEEP_RECENT_MESSAGES + 1 {
+        debug!(total, "Too few messages to compact – keeping everything");
+        return Ok(messages.to_vec());
+    }
+
+    let split_at = total.saturating_sub(KEEP_RECENT_MESSAGES);
+
+    info!(
+        total,
+        split_at,
+        keep = KEEP_RECENT_MESSAGES,
+        "Compacting conversation"
+    );
+
+    summarise_head_with_provider(provider, messages, split_at, model, 20_000, provider_options)
+        .await
+}
+
 /// Auto-compact `messages` if needed.  Updates `state` in place.
 /// Returns `Some(new_messages)` if compaction ran, `None` otherwise.
 pub async fn auto_compact_if_needed(
@@ -713,6 +870,43 @@ pub async fn auto_compact_if_needed(
     );
 
     match compact_conversation(client, messages, model).await {
+        Ok(new_msgs) => {
+            state.on_success();
+            info!(
+                original_count = messages.len(),
+                new_count = new_msgs.len(),
+                "Auto-compact complete"
+            );
+            Some(new_msgs)
+        }
+        Err(e) => {
+            warn!(error = %e, "Auto-compact failed");
+            state.on_failure();
+            None
+        }
+    }
+}
+
+pub async fn auto_compact_if_needed_with_provider(
+    provider: &dyn LlmProvider,
+    messages: &[Message],
+    input_tokens: u64,
+    model: &str,
+    state: &mut AutoCompactState,
+    provider_options: Value,
+) -> Option<Vec<Message>> {
+    if !should_auto_compact(input_tokens, model, state) {
+        return None;
+    }
+
+    info!(
+        input_tokens,
+        model,
+        compaction_count = state.compaction_count,
+        "Auto-compact triggered"
+    );
+
+    match compact_conversation_with_provider(provider, messages, model, provider_options).await {
         Ok(new_msgs) => {
             state.on_success();
             info!(
@@ -977,6 +1171,83 @@ pub async fn reactive_compact(
     })
 }
 
+pub async fn reactive_compact_with_provider(
+    messages: Vec<claurst_core::types::Message>,
+    provider: &dyn LlmProvider,
+    model: &str,
+    provider_options: Value,
+    cancel: tokio_util::sync::CancellationToken,
+    recently_modified: &[std::path::PathBuf],
+) -> Result<CompactResult, claurst_core::error::ClaudeError> {
+    if cancel.is_cancelled() {
+        return Err(claurst_core::error::ClaudeError::Cancelled);
+    }
+
+    let total = messages.len();
+    if total == 0 {
+        return Ok(CompactResult {
+            messages: vec![],
+            summary: String::new(),
+            tokens_freed: 0,
+        });
+    }
+
+    let stripped = strip_images(messages.clone());
+
+    let split_at = total.saturating_sub(KEEP_RECENT_MESSAGES);
+    if split_at == 0 {
+        return Ok(CompactResult {
+            messages,
+            summary: String::new(),
+            tokens_freed: 0,
+        });
+    }
+
+    let original_token_estimate = estimate_tokens_for_messages(&stripped[..split_at]) as u64;
+
+    let mut new_messages =
+        summarise_head_with_provider(provider, &stripped, split_at, model, 20_000, provider_options)
+            .await?;
+
+    let summary_text = new_messages
+        .first()
+        .map(|m| m.get_all_text())
+        .unwrap_or_default();
+
+    const MAX_FILES: usize = 5;
+    const MAX_FILE_BYTES: u64 = 50 * 1024;
+    let mut injected = 0;
+    for path in recently_modified.iter().take(MAX_FILES * 3) {
+        if injected >= MAX_FILES {
+            break;
+        }
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.len() > MAX_FILE_BYTES {
+            continue;
+        }
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let file_name = path.display().to_string();
+        let text = format!("<file path=\"{}\">\n{}\n</file>", file_name, content);
+        new_messages.push(claurst_core::types::Message::user(text));
+        injected += 1;
+    }
+
+    let tokens_after = estimate_tokens_for_messages(&new_messages) as u64;
+    let tokens_freed = original_token_estimate.saturating_sub(tokens_after);
+
+    Ok(CompactResult {
+        messages: new_messages,
+        summary: summary_text,
+        tokens_freed,
+    })
+}
+
 /// Emergency context collapse: produce an ultra-short summary that distils
 /// the entire conversation into the minimum needed to continue, then keep
 /// only the most recent user turn.
@@ -1073,6 +1344,111 @@ pub async fn context_collapse(
     ));
 
     // Find the last user message in the original list.
+    let last_user = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == claurst_core::types::Role::User)
+        .cloned();
+
+    let mut new_messages = vec![collapse_notice];
+    if let Some(last) = last_user {
+        new_messages.push(last);
+    }
+
+    let tokens_after = estimate_tokens_for_messages(&new_messages) as u64;
+    let tokens_freed = original_tokens.saturating_sub(tokens_after);
+
+    Ok(CompactResult {
+        messages: new_messages,
+        summary: summary_text,
+        tokens_freed,
+    })
+}
+
+pub async fn context_collapse_with_provider(
+    messages: Vec<claurst_core::types::Message>,
+    provider: &dyn LlmProvider,
+    model: &str,
+    provider_options: Value,
+) -> Result<CompactResult, claurst_core::error::ClaudeError> {
+    let total = messages.len();
+    if total == 0 {
+        return Ok(CompactResult {
+            messages: vec![],
+            summary: String::new(),
+            tokens_freed: 0,
+        });
+    }
+
+    let original_tokens = estimate_tokens_for_messages(&messages) as u64;
+
+    let mut transcript = String::new();
+    for msg in &messages {
+        let role = match msg.role {
+            claurst_core::types::Role::User => "Human",
+            claurst_core::types::Role::Assistant => "Assistant",
+        };
+        let text = msg.get_all_text();
+        if !text.is_empty() {
+            transcript.push_str(&format!("{}: {}\n\n", role, text));
+        }
+    }
+
+    let collapse_prompt = format!(
+        "EMERGENCY CONTEXT COLLAPSE — the conversation is at critical capacity.\n\
+         Produce an ULTRA-SHORT (max 500 words) emergency summary that captures:\n\
+         1. The user's most recent explicit request.\n\
+         2. The single most important decision made so far.\n\
+         3. Any file names or code snippets that are ESSENTIAL to continue.\n\
+         4. What was being worked on immediately before this collapse.\n\
+         Respond with plain text only — no XML tags, no tool calls.\n\n\
+         <conversation>\n{}\n</conversation>",
+        transcript
+    );
+
+    let request = ProviderRequest {
+        model: model.to_string(),
+        messages: vec![claurst_core::types::Message::user(collapse_prompt)],
+        system_prompt: Some(SystemPrompt::Text(
+            "You are a conversation summariser. Produce an emergency ultra-short \
+             summary as instructed. Plain text only."
+                .to_string(),
+        )),
+        tools: Vec::new(),
+        max_tokens: 1_000,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: Vec::new(),
+        thinking: None,
+        provider_options,
+    };
+
+    let response = provider.create_message(request).await?;
+    let summary_text = response
+        .content
+        .iter()
+        .filter_map(|block| {
+            if let ContentBlock::Text { text } = block {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    if summary_text.is_empty() {
+        return Err(claurst_core::error::ClaudeError::Other(
+            "Context-collapse summary was empty".to_string(),
+        ));
+    }
+
+    let collapse_notice = claurst_core::types::Message::user(format!(
+        "[EMERGENCY CONTEXT COLLAPSE — conversation condensed to stay within limits]\n\n{}",
+        summary_text
+    ));
+
     let last_user = messages
         .iter()
         .rev()
