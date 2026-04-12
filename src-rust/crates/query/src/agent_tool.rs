@@ -144,6 +144,9 @@ struct AgentInput {
     /// Optional: model override for this sub-agent.
     #[serde(default)]
     model: Option<String>,
+    /// Optional: explicit provider override (e.g., "openai", "google").
+    #[serde(default)]
+    provider: Option<String>,
     /// Set to "worktree" to run the agent in an isolated git worktree.
     /// Omit (or set to null) for shared working directory.
     #[serde(default)]
@@ -200,6 +203,10 @@ impl Tool for AgentTool {
                 "model": {
                     "type": "string",
                     "description": "Optional model to use for this agent"
+                },
+                "provider": {
+                    "type": "string",
+                    "description": "Explicit provider to use for this agent (e.g., 'openai', 'google'). When omitted, inherits from parent session."
                 },
                 "isolation": {
                     "type": "string",
