@@ -715,3 +715,168 @@ pub fn init_team_swarm_runner() {
 
     claurst_tools::register_agent_runner(runner);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AgentTool;
+    use claurst_api::{OpenAiProvider, ProviderRegistry};
+    use claurst_core::config::{Config, PermissionMode};
+    use claurst_core::permissions::AutoPermissionHandler;
+    use claurst_tools::{Tool, ToolContext};
+    use parking_lot::Mutex;
+    use serde_json::{json, Value};
+    use std::ffi::{OsStr, OsString};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, OnceLock};
+    use tempfile::TempDir;
+
+    fn make_tool_context(
+        provider_registry: Option<Arc<ProviderRegistry>>,
+        parent_provider: Option<&str>,
+    ) -> ToolContext {
+        let mut config = Config::default();
+        config.provider = parent_provider.map(str::to_string);
+
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            permission_mode: PermissionMode::Default,
+            permission_handler: Arc::new(AutoPermissionHandler {
+                mode: PermissionMode::Default,
+            }),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "agent-tool-test".to_string(),
+            file_history: Arc::new(Mutex::new(claurst_core::file_history::FileHistory::new())),
+            current_turn: Arc::new(AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config,
+            provider_registry,
+            model_registry: None,
+        }
+    }
+
+    fn make_openai_registry() -> Arc<ProviderRegistry> {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(OpenAiProvider::new("test-openai-key".to_string())));
+        Arc::new(registry)
+    }
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+
+        fn set_os(key: &'static str, value: Option<&OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn with_isolated_provider_auth<T>(f: impl FnOnce() -> T) -> T {
+        let _lock = env_lock().lock().unwrap();
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_os("HOME", Some(home.path().as_os_str()));
+        let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", None);
+        let _openai = EnvGuard::set("OPENAI_API_KEY", None);
+        f()
+    }
+
+    fn run_agent_tool(input: Value, ctx: &ToolContext) -> claurst_tools::ToolResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(AgentTool.execute(input, ctx))
+    }
+
+    #[test]
+    fn agent_tool_errors_when_provider_registry_missing() {
+        let ctx = make_tool_context(None, None);
+
+        let result = run_agent_tool(
+            json!({
+                "description": "missing-registry",
+                "prompt": "verify missing registry"
+            }),
+            &ctx,
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .content
+                .contains("provider_registry not available in ToolContext"),
+            "unexpected error: {}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn agent_tool_resolves_explicit_provider_without_network() {
+        with_isolated_provider_auth(|| {
+            let ctx = make_tool_context(Some(make_openai_registry()), None);
+
+            let result = run_agent_tool(
+                json!({
+                    "description": "explicit-provider",
+                    "prompt": "explicit provider success",
+                    "provider": "openai",
+                    "model": "gpt-4o",
+                    "max_turns": 0
+                }),
+                &ctx,
+            );
+
+            assert!(!result.is_error, "unexpected error: {}", result.content);
+            assert_eq!(result.content, "explicit provider success");
+        });
+    }
+
+    #[test]
+    fn agent_tool_inherits_parent_provider_without_network() {
+        with_isolated_provider_auth(|| {
+            let ctx = make_tool_context(Some(make_openai_registry()), Some("openai"));
+
+            let result = run_agent_tool(
+                json!({
+                    "description": "parent-provider",
+                    "prompt": "parent provider success",
+                    "max_turns": 0
+                }),
+                &ctx,
+            );
+
+            assert!(!result.is_error, "unexpected error: {}", result.content);
+            assert_eq!(result.content, "parent provider success");
+        });
+    }
+}
