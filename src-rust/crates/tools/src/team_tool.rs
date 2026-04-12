@@ -389,6 +389,8 @@ impl Tool for TeamCreateTool {
                 let role = spec.role.clone().unwrap_or_else(|| "assistant".to_string());
                 let tools = spec.tools.clone();
                 let agent_task = spec.task.clone().unwrap_or_else(|| params.task.clone());
+                let provider_override = spec.provider.clone();
+                let model_override = spec.model.clone();
                 let team_name_inner = final_name.clone();
                 let cancel = cancel_tokens[i].clone();
                 let ctx_inner = ctx_arc.clone();
@@ -418,8 +420,8 @@ impl Tool for TeamCreateTool {
                             system_prompt: Some(system_prompt),
                             max_turns: Some(10),
                             ctx: ctx_inner,
-                            provider_override: None,
-                            model_override: None,
+                            provider_override,
+                            model_override,
                         }) => out,
                         _ = cancel.cancelled() => "[Agent cancelled by TeamDelete]".to_string(),
                     };
