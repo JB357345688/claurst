@@ -255,10 +255,13 @@ fn normalize_ollama_api_base(api_base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderResolutionError, ResolutionSource, normalize_ollama_api_base,
-        resolve_provider_identity,
+        ProviderIdentity, ProviderResolutionError, ResolutionSource, materialize_provider,
+        normalize_ollama_api_base, resolve_provider_identity,
     };
-    use claurst_api::ModelRegistry;
+    use std::{collections::HashMap, sync::Arc};
+
+    use claurst_api::{ModelRegistry, OpenAiProvider, ProviderRegistry};
+    use claurst_core::config::ProviderConfig;
 
     fn assert_identity(
         explicit_provider: Option<&str>,
@@ -294,6 +297,18 @@ mod tests {
                 && error_model == model
                 && model_provider == expected_model_provider
         ));
+    }
+
+    fn provider_identity(
+        provider_id: &str,
+        model_id: &str,
+        resolution_source: ResolutionSource,
+    ) -> ProviderIdentity {
+        ProviderIdentity {
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            resolution_source,
+        }
     }
 
     #[test]
@@ -468,5 +483,60 @@ mod tests {
             "llama3",
             ResolutionSource::ExplicitProvider,
         );
+    }
+
+    #[test]
+    fn materialize_provider_returns_openai_target_from_happy_path() {
+        let identity = provider_identity("openai", "gpt-4o", ResolutionSource::ExplicitProvider);
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(OpenAiProvider::new("test-key".to_string())));
+
+        let target = materialize_provider(&identity, &registry, &HashMap::new())
+            .expect("materialization should succeed");
+
+        assert_eq!(target.provider_id, "openai");
+        assert_eq!(target.model_id, "gpt-4o");
+        assert_eq!(target.resolution_source, ResolutionSource::ExplicitProvider);
+        assert_eq!(target.provider.id(), "openai");
+    }
+
+    #[test]
+    fn materialize_provider_returns_no_credentials_for_unknown_provider() {
+        let identity = provider_identity(
+            "some-fake-provider",
+            "fake-model",
+            ResolutionSource::ExplicitProvider,
+        );
+        let registry = ProviderRegistry::new();
+
+        let error = materialize_provider(&identity, &registry, &HashMap::new())
+            .expect_err("materialization should fail without credentials");
+
+        assert!(matches!(
+            error,
+            ProviderResolutionError::NoCredentials(provider) if provider == "some-fake-provider"
+        ));
+    }
+
+    #[test]
+    fn materialize_provider_accepts_ollama_api_base_override() {
+        let identity = provider_identity("ollama", "llama3", ResolutionSource::ExplicitProvider);
+        let registry = ProviderRegistry::new();
+        let mut provider_configs = HashMap::new();
+        provider_configs.insert(
+            "ollama".to_string(),
+            ProviderConfig {
+                api_base: Some("http://custom:11434".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let target = materialize_provider(&identity, &registry, &provider_configs)
+            .expect("materialization should succeed for ollama api_base override");
+
+        assert_eq!(target.provider_id, "ollama");
+        assert_eq!(target.model_id, "llama3");
+        assert_eq!(target.resolution_source, ResolutionSource::ExplicitProvider);
+        assert_eq!(target.provider.id(), "ollama");
     }
 }
