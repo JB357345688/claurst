@@ -33,26 +33,21 @@ use uuid::Uuid;
 // Global agent-runner injection
 // ---------------------------------------------------------------------------
 
+/// Parameters for running a sub-agent via the registered runner.
+pub struct AgentRunParams {
+    pub description: String,
+    pub prompt: String,
+    pub tools: Option<Vec<String>>,
+    pub system_prompt: Option<String>,
+    pub max_turns: Option<u32>,
+    pub ctx: Arc<ToolContext>,
+    pub provider_override: Option<String>,
+    pub model_override: Option<String>,
+}
+
 /// A boxed async function that runs an agent sub-task and returns its output.
-///
-/// Arguments:
-///   description — short label for logging
-///   prompt      — full task prompt
-///   tools       — optional allowlist of tool names; None means all tools
-///   system      — optional system prompt override
-///   max_turns   — max agent turns (default 10 when None)
-///   ctx         — parent tool context (cloned in for the sub-agent)
-///
-/// Returns the agent's final text output.
 pub type AgentRunFn = Arc<
-    dyn Fn(
-            String,              // description
-            String,              // prompt
-            Option<Vec<String>>, // tools allowlist
-            Option<String>,      // system prompt
-            Option<u32>,         // max_turns
-            Arc<ToolContext>,    // context
-        ) -> Pin<Box<dyn Future<Output = String> + Send>>
+    dyn Fn(AgentRunParams) -> Pin<Box<dyn Future<Output = String> + Send>>
         + Send
         + Sync,
 >;
@@ -73,16 +68,9 @@ pub fn register_agent_runner(f: AgentRunFn) {
 ///
 /// Falls back to a stub result when no runner has been registered (e.g., in
 /// unit tests that don't initialise cc-query).
-async fn run_agent(
-    description: String,
-    prompt: String,
-    tools: Option<Vec<String>>,
-    system: Option<String>,
-    max_turns: Option<u32>,
-    ctx: Arc<ToolContext>,
-) -> String {
+async fn run_agent(params: AgentRunParams) -> String {
     if let Some(runner) = AGENT_RUNNER.get() {
-        runner(description, prompt, tools, system, max_turns, ctx).await
+        runner(params).await
     } else {
         "[No agent runner registered — cc-query not initialised]".to_string()
     }
@@ -409,14 +397,16 @@ impl Tool for TeamCreateTool {
                     }
 
                     let result = tokio::select! {
-                        out = run_agent(
+                        out = run_agent(AgentRunParams {
                             description,
-                            agent_task,
+                            prompt: agent_task,
                             tools,
-                            Some(system_prompt),
-                            Some(10),
-                            ctx_inner,
-                        ) => out,
+                            system_prompt: Some(system_prompt),
+                            max_turns: Some(10),
+                            ctx: ctx_inner,
+                            provider_override: None,
+                            model_override: None,
+                        }) => out,
                         _ = cancel.cancelled() => "[Agent cancelled by TeamDelete]".to_string(),
                     };
 
