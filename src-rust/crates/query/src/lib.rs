@@ -972,7 +972,7 @@ pub async fn run_query_loop(
                 top_k: None,
                 stop_sequences: vec![],
                 thinking: if caps.thinking {
-                    effective_thinking_budget.map(|b| claurst_api::ThinkingConfig::enabled(b))
+                    effective_thinking_budget.map(claurst_api::ThinkingConfig::enabled)
                 } else {
                     None
                 },
@@ -1044,10 +1044,14 @@ pub async fn run_query_loop(
                                         usage.cache_read_input_tokens = u.cache_read_input_tokens;
                                         usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
                                     }
-                                    claurst_api::StreamEvent::ContentBlockStart { index, content_block } => {
-                                        if let ContentBlock::ToolUse { id, name, .. } = content_block {
-                                            tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new()));
-                                        }
+                                    claurst_api::StreamEvent::ContentBlockStart {
+                                        index,
+                                        content_block: ContentBlock::ToolUse { id, name, .. },
+                                    } => {
+                                        tool_call_blocks.insert(
+                                            *index,
+                                            (id.clone(), name.clone(), String::new()),
+                                        );
                                     }
                                     claurst_api::StreamEvent::TextDelta { text, .. } => {
                                         text_chunks.push(text.clone());
@@ -1155,7 +1159,8 @@ pub async fn run_query_loop(
                             input_json: tool_input.to_string(),
                         });
                     }
-                    let result = execute_tool(&*tool_name, &tool_input, tools, &tool_ctx).await;
+                    let result =
+                        execute_tool(tool_name.as_str(), &tool_input, tools, tool_ctx).await;
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::ToolEnd {
                             tool_name: tool_name.clone(),
