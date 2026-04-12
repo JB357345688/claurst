@@ -86,9 +86,7 @@ impl AuthStore {
                     }
                 }
                 StoredCredential::OAuthToken {
-                    access,
-                    refresh,
-                    ..
+                    access, refresh, ..
                 } if provider_id == "github-copilot" => {
                     if !refresh.is_empty() {
                         return Some(refresh.clone());
@@ -243,9 +241,6 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            store.api_key_for("ollama").as_deref(),
-            Some("stored-key")
-        );
+        assert_eq!(store.api_key_for("ollama").as_deref(), Some("stored-key"));
     }
 }

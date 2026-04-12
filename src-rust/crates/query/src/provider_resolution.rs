@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use claurst_api::{LlmProvider, ModelRegistry, ProviderRegistry};
-use claurst_core::{AuthStore, ProviderId, config::ProviderConfig};
+use claurst_core::{config::ProviderConfig, AuthStore, ProviderId};
 
 pub const KNOWN_PROVIDERS: &[&str] = &[
     "anthropic",
@@ -185,8 +185,7 @@ pub fn materialize_provider(
         let base_url = format!("{}/v1", override_base.trim_end_matches('/'));
         let overridden: Option<Arc<dyn LlmProvider>> = match identity.provider_id.as_str() {
             "ollama" => Some(Arc::new(
-                claurst_api::providers::openai_compat_providers::ollama()
-                    .with_base_url(base_url),
+                claurst_api::providers::openai_compat_providers::ollama().with_base_url(base_url),
             )),
             "lmstudio" | "lm-studio" => Some(Arc::new(
                 claurst_api::providers::openai_compat_providers::lm_studio()
@@ -255,8 +254,8 @@ fn normalize_ollama_api_base(api_base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderIdentity, ProviderResolutionError, ResolutionSource, materialize_provider,
-        normalize_ollama_api_base, resolve_provider_identity,
+        materialize_provider, normalize_ollama_api_base, resolve_provider_identity,
+        ProviderIdentity, ProviderResolutionError, ResolutionSource,
     };
     use std::{collections::HashMap, sync::Arc};
 
@@ -373,11 +372,7 @@ mod tests {
 
     #[test]
     fn p3_explicit_provider_conflicts_with_model_prefix() {
-        assert_provider_model_conflict(
-            "openai",
-            "anthropic/claude-sonnet-4-20250514",
-            "anthropic",
-        );
+        assert_provider_model_conflict("openai", "anthropic/claude-sonnet-4-20250514", "anthropic");
     }
 
     #[test]
