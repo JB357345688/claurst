@@ -166,6 +166,12 @@ struct AgentSpec {
     /// `task` is used.
     #[serde(default)]
     task: Option<String>,
+    /// Optional provider override for this agent.
+    #[serde(default)]
+    provider: Option<String>,
+    /// Optional model override for this agent.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +241,14 @@ impl Tool for TeamCreateTool {
                             "task": {
                                 "type": "string",
                                 "description": "Per-agent task override.  Falls back to top-level task."
+                            },
+                            "provider": {
+                                "type": "string",
+                                "description": "Explicit provider for this agent (e.g., 'openai'). Inherits from parent if omitted."
+                            },
+                            "model": {
+                                "type": "string",
+                                "description": "Model override for this agent. Inherits from parent if omitted."
                             }
                         },
                         "required": ["name"]
