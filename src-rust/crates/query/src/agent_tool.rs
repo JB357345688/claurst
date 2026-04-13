@@ -724,14 +724,21 @@ pub fn init_team_swarm_runner() {
 #[cfg(test)]
 mod tests {
     use super::AgentTool;
-    use claurst_api::{OpenAiProvider, ProviderRegistry};
+    use async_trait::async_trait;
+    use claurst_api::{
+        LlmProvider, OpenAiProvider, ProviderCapabilities, ProviderError, ProviderRegistry,
+        ProviderStatus, StreamEvent, SystemPromptStyle,
+    };
     use claurst_core::config::{Config, PermissionMode};
     use claurst_core::permissions::AutoPermissionHandler;
+    use claurst_core::{ContentBlock, ProviderId, UsageInfo};
     use claurst_tools::{Tool, ToolContext};
+    use futures::stream;
     use parking_lot::Mutex;
     use serde_json::{json, Value};
     use std::ffi::{OsStr, OsString};
-    use std::sync::atomic::AtomicUsize;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock};
     use tempfile::TempDir;
 
@@ -764,6 +771,111 @@ mod tests {
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(OpenAiProvider::new("test-openai-key".to_string())));
         Arc::new(registry)
+    }
+
+    struct TrackingOpenAiProvider {
+        id: ProviderId,
+        invocations: Arc<AtomicUsize>,
+        response_text: String,
+    }
+
+    impl TrackingOpenAiProvider {
+        fn new(invocations: Arc<AtomicUsize>, response_text: impl Into<String>) -> Self {
+            Self {
+                id: ProviderId::new("openai"),
+                invocations,
+                response_text: response_text.into(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for TrackingOpenAiProvider {
+        fn id(&self) -> &ProviderId {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            "OpenAI"
+        }
+
+        async fn create_message(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, ProviderError> {
+            panic!("create_message is not used by agent_tool streaming dispatch")
+        }
+
+        async fn create_message_stream(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<
+            Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
+            ProviderError,
+        > {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(stream::iter(vec![
+                Ok(StreamEvent::MessageStart {
+                    id: "tracking-openai-message".to_string(),
+                    model: "gpt-4o".to_string(),
+                    usage: UsageInfo::default(),
+                }),
+                Ok(StreamEvent::ContentBlockStart {
+                    index: 0,
+                    content_block: ContentBlock::Text {
+                        text: String::new(),
+                    },
+                }),
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: self.response_text.clone(),
+                }),
+                Ok(StreamEvent::ContentBlockStop { index: 0 }),
+                Ok(StreamEvent::MessageDelta {
+                    stop_reason: Some(claurst_api::provider_types::StopReason::EndTurn),
+                    usage: Some(UsageInfo {
+                        output_tokens: 1,
+                        ..UsageInfo::default()
+                    }),
+                }),
+                Ok(StreamEvent::MessageStop),
+            ])))
+        }
+
+        async fn list_models(&self) -> Result<Vec<claurst_api::ModelInfo>, ProviderError> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
+            Ok(ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                streaming: true,
+                tool_calling: false,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: SystemPromptStyle::SystemMessage,
+            }
+        }
+    }
+
+    fn make_tracking_openai_registry(
+        response_text: &str,
+    ) -> (Arc<ProviderRegistry>, Arc<AtomicUsize>) {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(TrackingOpenAiProvider::new(
+            invocations.clone(),
+            response_text,
+        )));
+        (Arc::new(registry), invocations)
     }
 
     fn env_lock() -> &'static std::sync::Mutex<()> {
@@ -846,9 +958,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_tool_resolves_explicit_provider_without_network() {
+    fn agent_explicit_provider_routes_to_openai_provider() {
         with_isolated_provider_auth(|| {
-            let ctx = make_tool_context(Some(make_openai_registry()), None);
+            let sentinel = "openai provider sentinel";
+            let (registry, invocations) = make_tracking_openai_registry(sentinel);
+            let ctx = make_tool_context(Some(registry), None);
 
             let result = run_agent_tool(
                 json!({
@@ -856,13 +970,14 @@ mod tests {
                     "prompt": "explicit provider success",
                     "provider": "openai",
                     "model": "gpt-4o",
-                    "max_turns": 0
+                    "max_turns": 1
                 }),
                 &ctx,
             );
 
             assert!(!result.is_error, "unexpected error: {}", result.content);
-            assert_eq!(result.content, "explicit provider success");
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+            assert_eq!(result.content, sentinel);
         });
     }
 
