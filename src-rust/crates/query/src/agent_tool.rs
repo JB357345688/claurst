@@ -726,8 +726,8 @@ mod tests {
     use super::AgentTool;
     use async_trait::async_trait;
     use claurst_api::{
-        LlmProvider, OpenAiProvider, ProviderCapabilities, ProviderError, ProviderRegistry,
-        ProviderStatus, StreamEvent, SystemPromptStyle,
+        LlmProvider, ProviderCapabilities, ProviderError, ProviderRegistry, ProviderStatus,
+        StreamEvent, SystemPromptStyle,
     };
     use claurst_core::config::{Config, PermissionMode};
     use claurst_core::permissions::AutoPermissionHandler;
@@ -765,12 +765,6 @@ mod tests {
             provider_registry,
             model_registry: None,
         }
-    }
-
-    fn make_openai_registry() -> Arc<ProviderRegistry> {
-        let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(OpenAiProvider::new("test-openai-key".to_string())));
-        Arc::new(registry)
     }
 
     struct TrackingOpenAiProvider {
@@ -982,21 +976,24 @@ mod tests {
     }
 
     #[test]
-    fn agent_tool_inherits_parent_provider_without_network() {
+    fn agent_parent_inherits_provider_openai_dispatch() {
         with_isolated_provider_auth(|| {
-            let ctx = make_tool_context(Some(make_openai_registry()), Some("openai"));
+            let sentinel = "inherited openai provider sentinel";
+            let (registry, invocations) = make_tracking_openai_registry(sentinel);
+            let ctx = make_tool_context(Some(registry), Some("openai"));
 
             let result = run_agent_tool(
                 json!({
                     "description": "parent-provider",
                     "prompt": "parent provider success",
-                    "max_turns": 0
+                    "max_turns": 1
                 }),
                 &ctx,
             );
 
             assert!(!result.is_error, "unexpected error: {}", result.content);
-            assert_eq!(result.content, "parent provider success");
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+            assert_eq!(result.content, sentinel);
         });
     }
 }
