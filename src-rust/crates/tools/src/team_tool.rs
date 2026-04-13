@@ -46,11 +46,8 @@ pub struct AgentRunParams {
 }
 
 /// A boxed async function that runs an agent sub-task and returns its output.
-pub type AgentRunFn = Arc<
-    dyn Fn(AgentRunParams) -> Pin<Box<dyn Future<Output = String> + Send>>
-        + Send
-        + Sync,
->;
+pub type AgentRunFn =
+    Arc<dyn Fn(AgentRunParams) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
 
 static AGENT_RUNNER: OnceCell<AgentRunFn> = OnceCell::new();
 

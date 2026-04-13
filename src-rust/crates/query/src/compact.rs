@@ -845,8 +845,15 @@ pub async fn compact_conversation_with_provider(
         "Compacting conversation"
     );
 
-    summarise_head_with_provider(provider, messages, split_at, model, 20_000, provider_options)
-        .await
+    summarise_head_with_provider(
+        provider,
+        messages,
+        split_at,
+        model,
+        20_000,
+        provider_options,
+    )
+    .await
 }
 
 /// Auto-compact `messages` if needed.  Updates `state` in place.
@@ -1205,9 +1212,15 @@ pub async fn reactive_compact_with_provider(
 
     let original_token_estimate = estimate_tokens_for_messages(&stripped[..split_at]) as u64;
 
-    let mut new_messages =
-        summarise_head_with_provider(provider, &stripped, split_at, model, 20_000, provider_options)
-            .await?;
+    let mut new_messages = summarise_head_with_provider(
+        provider,
+        &stripped,
+        split_at,
+        model,
+        20_000,
+        provider_options,
+    )
+    .await?;
 
     let summary_text = new_messages
         .first()

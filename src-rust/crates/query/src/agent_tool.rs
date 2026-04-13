@@ -30,7 +30,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::provider_resolution::{materialize_provider, resolve_provider_identity, KNOWN_PROVIDERS};
+use crate::provider_resolution::{
+    materialize_provider, resolve_provider_identity, KNOWN_PROVIDERS,
+};
 use crate::{run_query_loop, QueryConfig, QueryOutcome};
 
 // ---------------------------------------------------------------------------
@@ -277,41 +279,41 @@ impl Tool for AgentTool {
             }
         };
 
-        let identity = match resolve_provider_identity(provider_hint, &model, ctx.model_registry.as_deref()) {
-            Ok(identity) => identity,
-            Err(e) => return ToolResult::error(format!("Provider resolution failed: {}", e)),
-        };
+        let identity =
+            match resolve_provider_identity(provider_hint, &model, ctx.model_registry.as_deref()) {
+                Ok(identity) => identity,
+                Err(e) => return ToolResult::error(format!("Provider resolution failed: {}", e)),
+            };
 
         let target = match materialize_provider(&identity, registry, &ctx.config.provider_configs) {
             Ok(target) => target,
             Err(e) => return ToolResult::error(format!("Provider materialization failed: {}", e)),
         };
 
-        let client_config = if target.provider_id == "anthropic" {
-            let (api_key, use_bearer_auth) = match ctx
-                .config
-                .resolve_auth_async()
-                .await
-                .or_else(|| claurst_core::AuthStore::load().api_key_for("anthropic").map(|key| (key, false)))
-            {
-                Some(auth) => auth,
-                None => {
-                    return ToolResult::error(
-                        "No Anthropic credentials available for foreground sub-agent client"
-                            .to_string(),
-                    )
-                }
-            };
+        let client_config =
+            if target.provider_id == "anthropic" {
+                let (api_key, use_bearer_auth) =
+                    match ctx.config.resolve_auth_async().await.or_else(|| {
+                        claurst_core::AuthStore::load()
+                            .api_key_for("anthropic")
+                            .map(|key| (key, false))
+                    }) {
+                        Some(auth) => auth,
+                        None => return ToolResult::error(
+                            "No Anthropic credentials available for foreground sub-agent client"
+                                .to_string(),
+                        ),
+                    };
 
-            ClientConfig {
-                api_key,
-                api_base: ctx.config.resolve_api_base(),
-                use_bearer_auth,
-                ..Default::default()
-            }
-        } else {
-            ClientConfig::default()
-        };
+                ClientConfig {
+                    api_key,
+                    api_base: ctx.config.resolve_api_base(),
+                    use_bearer_auth,
+                    ..Default::default()
+                }
+            } else {
+                ClientConfig::default()
+            };
 
         let client = match AnthropicClient::new(client_config) {
             Ok(client) => Arc::new(client),
@@ -624,8 +626,11 @@ pub fn init_team_swarm_runner() {
                     }
                 };
 
-                let target = match materialize_provider(&identity, &registry, &ctx.config.provider_configs)
-                {
+                let target = match materialize_provider(
+                    &identity,
+                    &registry,
+                    &ctx.config.provider_configs,
+                ) {
                     Ok(target) => target,
                     Err(e) => {
                         return format!(
