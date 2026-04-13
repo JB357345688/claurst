@@ -2385,6 +2385,41 @@ mod tests {
     }
 
     #[test]
+    fn provider_registry_some_resolution_failure_does_not_fallback_to_legacy_anthropic() {
+        with_isolated_provider_auth(|| {
+            let mut config = make_config(None, None);
+            config.model = "gpt-4o".to_string();
+            config.provider_registry = Some(Arc::new(claurst_api::ProviderRegistry::new()));
+
+            let err_text = match run_root_query(config, Some("openai")) {
+                QueryOutcome::Error(err) => err.to_string(),
+                other => panic!("expected registry-backed seam error, got {:?}", other),
+            };
+
+            assert!(
+                err_text.contains("No credentials available for provider 'openai'"),
+                "unexpected error: {}",
+                err_text
+            );
+            assert!(
+                !err_text.contains("Authentication error: No API key for the selected model."),
+                "unexpected legacy fallback error: {}",
+                err_text
+            );
+            assert!(
+                !err_text.contains("Model 'gpt-4o' is an OpenAI model."),
+                "unexpected legacy fallback error: {}",
+                err_text
+            );
+            assert!(
+                !err_text.contains("Use `--provider openai` or set OPENAI_API_KEY."),
+                "unexpected legacy fallback error: {}",
+                err_text
+            );
+        });
+    }
+
+    #[test]
     fn test_build_provider_options_for_google_gemini_3() {
         let options = build_provider_options(
             "google",
