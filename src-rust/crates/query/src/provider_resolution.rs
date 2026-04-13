@@ -257,10 +257,159 @@ mod tests {
         materialize_provider, normalize_ollama_api_base, resolve_provider_identity,
         ProviderIdentity, ProviderResolutionError, ResolutionSource,
     };
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        ffi::{OsStr, OsString},
+        future::Future,
+        sync::{Arc, Mutex, OnceLock},
+    };
 
-    use claurst_api::{ModelRegistry, OpenAiProvider, ProviderRegistry};
-    use claurst_core::config::ProviderConfig;
+    use async_trait::async_trait;
+    use claurst_api::{
+        LlmProvider, ModelRegistry, OpenAiProvider, ProviderCapabilities, ProviderError,
+        ProviderRegistry, ProviderStatus, SystemPromptStyle,
+    };
+    use claurst_core::{config::ProviderConfig, AuthStore, ProviderId, StoredCredential};
+    use tempfile::TempDir;
+
+    struct TestProvider {
+        id: ProviderId,
+        name: String,
+    }
+
+    impl TestProvider {
+        fn new(id: &str, name: &str) -> Self {
+            Self {
+                id: ProviderId::new(id),
+                name: name.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for TestProvider {
+        fn id(&self) -> &ProviderId {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn create_message(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, ProviderError> {
+            panic!("create_message is not used in provider_resolution tests")
+        }
+
+        async fn create_message_stream(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = Result<claurst_api::StreamEvent, ProviderError>>
+                        + Send,
+                >,
+            >,
+            ProviderError,
+        > {
+            panic!("create_message_stream is not used in provider_resolution tests")
+        }
+
+        async fn list_models(&self) -> Result<Vec<claurst_api::ModelInfo>, ProviderError> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
+            Ok(ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                streaming: false,
+                tool_calling: false,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: SystemPromptStyle::SystemMessage,
+            }
+        }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+
+        fn set_os(key: &'static str, value: Option<&OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn with_isolated_provider_auth<T>(f: impl FnOnce() -> T) -> T {
+        let _lock = env_lock().lock().unwrap();
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_os("HOME", Some(home.path().as_os_str()));
+        let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", None);
+        let _openai = EnvGuard::set("OPENAI_API_KEY", None);
+        let _ollama = EnvGuard::set("OLLAMA_API_KEY", None);
+        let _lm_studio = EnvGuard::set("LM_STUDIO_HOST", None);
+        let _llama_cpp = EnvGuard::set("LLAMA_CPP_HOST", None);
+        f()
+    }
+
+    fn run_async<T>(future: impl Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    fn assert_unavailable_reason(status: ProviderStatus, expected_reason: &str) {
+        assert!(
+            matches!(
+                status,
+                ProviderStatus::Unavailable { ref reason } if reason == expected_reason
+            ),
+            "unexpected provider status: {status:?}"
+        );
+    }
 
     fn assert_identity(
         explicit_provider: Option<&str>,
@@ -533,5 +682,108 @@ mod tests {
         assert_eq!(target.model_id, "llama3");
         assert_eq!(target.resolution_source, ResolutionSource::ExplicitProvider);
         assert_eq!(target.provider.id(), "ollama");
+    }
+
+    #[test]
+    fn materialize_provider_prefers_auth_store_provider_over_registry() {
+        with_isolated_provider_auth(|| {
+            let identity =
+                provider_identity("openai", "gpt-4o", ResolutionSource::ExplicitProvider);
+            let mut registry = ProviderRegistry::new();
+            registry.register(Arc::new(TestProvider::new("openai", "Registry OpenAI")));
+
+            let mut auth_store = AuthStore::default();
+            auth_store.set(
+                "openai",
+                StoredCredential::ApiKey {
+                    key: "auth-store-key".to_string(),
+                },
+            );
+
+            let target = materialize_provider(&identity, &registry, &HashMap::new())
+                .expect("materialization should prefer the auth-store runtime provider");
+
+            assert_eq!(target.provider_id, "openai");
+            assert_eq!(target.model_id, "gpt-4o");
+            assert_eq!(target.resolution_source, ResolutionSource::ExplicitProvider);
+            assert_eq!(target.provider.id(), "openai");
+            assert_eq!(target.provider.name(), "OpenAI");
+            assert_ne!(target.provider.name(), "Registry OpenAI");
+        });
+    }
+
+    #[test]
+    fn materialize_provider_applies_lm_studio_api_base_override() {
+        with_isolated_provider_auth(|| {
+            let _lm_studio_host = EnvGuard::set("LM_STUDIO_HOST", Some("http://localhost:bad"));
+            let identity =
+                provider_identity("lm-studio", "local-model", ResolutionSource::ExplicitProvider);
+            let registry = ProviderRegistry::new();
+            let mut provider_configs = HashMap::new();
+            provider_configs.insert(
+                "lm-studio".to_string(),
+                ProviderConfig {
+                    api_base: Some("https://example.invalid/lm-studio".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let target = materialize_provider(&identity, &registry, &provider_configs)
+                .expect("materialization should succeed for lm-studio api_base override");
+            let status = run_async(target.provider.health_check())
+                .expect("health check should yield a provider status");
+
+            assert_eq!(target.provider_id, "lm-studio");
+            assert_eq!(target.model_id, "local-model");
+            assert_eq!(target.resolution_source, ResolutionSource::ExplicitProvider);
+            assert_eq!(target.provider.id(), "lm-studio");
+            assert_unavailable_reason(status, "No API key configured");
+        });
+    }
+
+    #[test]
+    fn materialize_provider_applies_llama_cpp_api_base_override() {
+        with_isolated_provider_auth(|| {
+            let _llama_cpp_host = EnvGuard::set("LLAMA_CPP_HOST", Some("http://localhost:bad"));
+            let identity =
+                provider_identity("llama-cpp", "local-model", ResolutionSource::ExplicitProvider);
+            let registry = ProviderRegistry::new();
+            let mut provider_configs = HashMap::new();
+            provider_configs.insert(
+                "llama-cpp".to_string(),
+                ProviderConfig {
+                    api_base: Some("https://example.invalid/llama-cpp".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let target = materialize_provider(&identity, &registry, &provider_configs)
+                .expect("materialization should succeed for llama-cpp api_base override");
+            let status = run_async(target.provider.health_check())
+                .expect("health check should yield a provider status");
+
+            assert_eq!(target.provider_id, "llama-cpp");
+            assert_eq!(target.model_id, "local-model");
+            assert_eq!(target.resolution_source, ResolutionSource::ExplicitProvider);
+            assert_eq!(target.provider.id(), "llama-cpp");
+            assert_unavailable_reason(status, "No API key configured");
+        });
+    }
+
+    #[test]
+    fn materialize_provider_returns_no_credentials_for_known_provider_without_auth() {
+        with_isolated_provider_auth(|| {
+            let identity =
+                provider_identity("openai", "gpt-4o", ResolutionSource::ExplicitProvider);
+            let registry = ProviderRegistry::new();
+
+            let error = materialize_provider(&identity, &registry, &HashMap::new())
+                .expect_err("materialization should fail without openai credentials");
+
+            assert!(matches!(
+                error,
+                ProviderResolutionError::NoCredentials(provider) if provider == "openai"
+            ));
+        });
     }
 }
