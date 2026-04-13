@@ -83,7 +83,7 @@ async fn run_scheduler_loop(
                 let mut messages = vec![Message::user(task.prompt.clone())];
 
                 let outcome = run_query_loop(
-                    client.as_ref(),
+                    Some(client.as_ref()),
                     &mut messages,
                     &tools,
                     &tool_ctx,

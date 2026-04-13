@@ -673,7 +673,7 @@ const MAX_TOKENS_RECOVERY_MSG: &str =
 /// appended as a plain user message between turns.  Callers that do not need
 /// command queuing may pass `None` or an empty `Vec`.
 pub async fn run_query_loop(
-    client: &claurst_api::AnthropicClient,
+    legacy_client: Option<&claurst_api::AnthropicClient>,
     messages: &mut Vec<Message>,
     tools: &[Box<dyn Tool>],
     tool_ctx: &ToolContext,
@@ -1285,6 +1285,15 @@ pub async fn run_query_loop(
                 usage,
             };
         }
+
+        let client = match legacy_client {
+            Some(client) => client,
+            None => {
+                return QueryOutcome::Error(ClaudeError::Api(
+                    "Legacy Anthropic client unavailable for non-registry query path".to_string(),
+                ))
+            }
+        };
 
         // Send to API
         debug!(turn, model = %effective_model, "Sending API request");
@@ -2215,7 +2224,7 @@ mod tests {
             let cost_tracker = tool_ctx.cost_tracker.clone();
 
             run_query_loop(
-                &client,
+                Some(&client),
                 &mut messages,
                 &tools,
                 &tool_ctx,

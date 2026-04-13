@@ -16,8 +16,6 @@
 //     Use poll_background_agent() to check completion status.
 
 use async_trait::async_trait;
-use claurst_api::client::ClientConfig;
-use claurst_api::AnthropicClient;
 use claurst_core::types::Message;
 use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use dashmap::DashMap;
@@ -290,36 +288,6 @@ impl Tool for AgentTool {
             Err(e) => return ToolResult::error(format!("Provider materialization failed: {}", e)),
         };
 
-        let client_config =
-            if target.provider_id == "anthropic" {
-                let (api_key, use_bearer_auth) =
-                    match ctx.config.resolve_auth_async().await.or_else(|| {
-                        claurst_core::AuthStore::load()
-                            .api_key_for("anthropic")
-                            .map(|key| (key, false))
-                    }) {
-                        Some(auth) => auth,
-                        None => return ToolResult::error(
-                            "No Anthropic credentials available for foreground sub-agent client"
-                                .to_string(),
-                        ),
-                    };
-
-                ClientConfig {
-                    api_key,
-                    api_base: ctx.config.resolve_api_base(),
-                    use_bearer_auth,
-                    ..Default::default()
-                }
-            } else {
-                ClientConfig::default()
-            };
-
-        let client = match AnthropicClient::new(client_config) {
-            Ok(client) => Arc::new(client),
-            Err(e) => return ToolResult::error(format!("Failed to create client: {}", e)),
-        };
-
         let system_prompt = params.system_prompt.unwrap_or_else(|| {
             let mut prompt = "You are a specialized AI agent helping with a specific sub-task. \
              Complete the task thoroughly and return your findings."
@@ -425,7 +393,6 @@ impl Tool for AgentTool {
                 .filter(|t| t.name() != claurst_core::constants::TOOL_NAME_AGENT)
                 .collect();
 
-            let client_bg = client.clone();
             let ctx_bg = foreground_ctx.clone();
             let config_bg = query_config.clone();
             let cost_tracker_bg = ctx.cost_tracker.clone();
@@ -437,7 +404,7 @@ impl Tool for AgentTool {
                 let cancel = CancellationToken::new();
                 let mut messages = vec![Message::user(prompt_bg)];
                 let outcome = run_query_loop(
-                    client_bg.as_ref(),
+                    None,
                     &mut messages,
                     &agent_tools_bg,
                     &ctx_bg,
@@ -483,7 +450,7 @@ impl Tool for AgentTool {
         let cancel = CancellationToken::new();
 
         let outcome = run_query_loop(
-            client.as_ref(),
+            None,
             &mut messages,
             &agent_tools,
             &foreground_ctx,
@@ -640,42 +607,6 @@ pub fn init_team_swarm_runner() {
                     }
                 };
 
-                let client_config = if target.provider_id == "anthropic" {
-                    let (api_key, use_bearer_auth) = match ctx
-                        .config
-                        .resolve_auth_async()
-                        .await
-                        .or_else(|| {
-                            claurst_core::AuthStore::load()
-                                .api_key_for("anthropic")
-                                .map(|key| (key, false))
-                        }) {
-                        Some(auth) => auth,
-                        None => {
-                            return format!(
-                                "[Agent '{}' failed: no Anthropic credentials available for runner client]",
-                                description
-                            )
-                        }
-                    };
-
-                    ClientConfig {
-                        api_key,
-                        api_base: ctx.config.resolve_api_base(),
-                        use_bearer_auth,
-                        ..Default::default()
-                    }
-                } else {
-                    ClientConfig::default()
-                };
-
-                let client = match AnthropicClient::new(client_config) {
-                    Ok(client) => Arc::new(client),
-                    Err(e) => {
-                        return format!("[Agent '{}' failed to create client: {}]", description, e)
-                    }
-                };
-
                 let system_prompt = system_prompt.unwrap_or_else(|| {
                     "You are a specialized AI agent helping with a specific sub-task. \
                      Complete the task thoroughly and return your findings."
@@ -701,7 +632,7 @@ pub fn init_team_swarm_runner() {
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let mut messages = vec![Message::user(prompt)];
                 let outcome = run_query_loop(
-                    client.as_ref(),
+                    None,
                     &mut messages,
                     &agent_tools,
                     &runner_ctx,
