@@ -732,7 +732,7 @@ mod tests {
     use claurst_core::config::{Config, PermissionMode};
     use claurst_core::permissions::AutoPermissionHandler;
     use claurst_core::{ContentBlock, ProviderId, UsageInfo};
-    use claurst_tools::{Tool, ToolContext};
+    use claurst_tools::{TeamCreateTool, Tool, ToolContext};
     use futures::stream;
     use parking_lot::Mutex;
     use serde_json::{json, Value};
@@ -767,16 +767,29 @@ mod tests {
         }
     }
 
-    struct TrackingOpenAiProvider {
+    struct TrackingStreamingProvider {
         id: ProviderId,
+        name: String,
+        message_id: String,
+        model_name: String,
         invocations: Arc<AtomicUsize>,
         response_text: String,
     }
 
-    impl TrackingOpenAiProvider {
-        fn new(invocations: Arc<AtomicUsize>, response_text: impl Into<String>) -> Self {
+    impl TrackingStreamingProvider {
+        fn new(
+            provider_id: &str,
+            provider_name: &str,
+            message_id: &str,
+            model_name: &str,
+            invocations: Arc<AtomicUsize>,
+            response_text: impl Into<String>,
+        ) -> Self {
             Self {
-                id: ProviderId::new("openai"),
+                id: ProviderId::new(provider_id),
+                name: provider_name.to_string(),
+                message_id: message_id.to_string(),
+                model_name: model_name.to_string(),
                 invocations,
                 response_text: response_text.into(),
             }
@@ -784,13 +797,13 @@ mod tests {
     }
 
     #[async_trait]
-    impl LlmProvider for TrackingOpenAiProvider {
+    impl LlmProvider for TrackingStreamingProvider {
         fn id(&self) -> &ProviderId {
             &self.id
         }
 
         fn name(&self) -> &str {
-            "OpenAI"
+            &self.name
         }
 
         async fn create_message(
@@ -810,8 +823,8 @@ mod tests {
             self.invocations.fetch_add(1, Ordering::SeqCst);
             Ok(Box::pin(stream::iter(vec![
                 Ok(StreamEvent::MessageStart {
-                    id: "tracking-openai-message".to_string(),
-                    model: "gpt-4o".to_string(),
+                    id: self.message_id.clone(),
+                    model: self.model_name.clone(),
                     usage: UsageInfo::default(),
                 }),
                 Ok(StreamEvent::ContentBlockStart {
@@ -865,11 +878,45 @@ mod tests {
     ) -> (Arc<ProviderRegistry>, Arc<AtomicUsize>) {
         let invocations = Arc::new(AtomicUsize::new(0));
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(TrackingOpenAiProvider::new(
+        registry.register(Arc::new(TrackingStreamingProvider::new(
+            "openai",
+            "OpenAI",
+            "tracking-openai-message",
+            "gpt-4o",
             invocations.clone(),
             response_text,
         )));
         (Arc::new(registry), invocations)
+    }
+
+    fn make_mixed_tracking_registry(
+        openai_response_text: &str,
+        google_response_text: &str,
+    ) -> (
+        Arc<ProviderRegistry>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let openai_invocations = Arc::new(AtomicUsize::new(0));
+        let google_invocations = Arc::new(AtomicUsize::new(0));
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(TrackingStreamingProvider::new(
+            "openai",
+            "OpenAI",
+            "tracking-openai-message",
+            "gpt-4o",
+            openai_invocations.clone(),
+            openai_response_text,
+        )));
+        registry.register(Arc::new(TrackingStreamingProvider::new(
+            "google",
+            "Google",
+            "tracking-google-message",
+            "gemini-2.5-flash",
+            google_invocations.clone(),
+            google_response_text,
+        )));
+        (Arc::new(registry), openai_invocations, google_invocations)
     }
 
     fn env_lock() -> &'static std::sync::Mutex<()> {
@@ -917,6 +964,7 @@ mod tests {
         let _home = EnvGuard::set_os("HOME", Some(home.path().as_os_str()));
         let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", None);
         let _openai = EnvGuard::set("OPENAI_API_KEY", None);
+        let _google = EnvGuard::set("GOOGLE_API_KEY", None);
         f()
     }
 
@@ -927,6 +975,20 @@ mod tests {
             .unwrap();
 
         runtime.block_on(AgentTool.execute(input, ctx))
+    }
+
+    fn init_team_swarm_runner_once() {
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(super::init_team_swarm_runner);
+    }
+
+    fn run_team_create_tool(input: Value, ctx: &ToolContext) -> claurst_tools::ToolResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(TeamCreateTool.execute(input, ctx))
     }
 
     #[test]
@@ -994,6 +1056,67 @@ mod tests {
             assert!(!result.is_error, "unexpected error: {}", result.content);
             assert_eq!(invocations.load(Ordering::SeqCst), 1);
             assert_eq!(result.content, sentinel);
+        });
+    }
+
+    #[test]
+    fn teamcreate_mixed_providers_per_agent_dispatch() {
+        with_isolated_provider_auth(|| {
+            init_team_swarm_runner_once();
+
+            let openai_sentinel = "team openai provider sentinel";
+            let google_sentinel = "team google provider sentinel";
+            let (registry, openai_invocations, google_invocations) =
+                make_mixed_tracking_registry(openai_sentinel, google_sentinel);
+            let ctx = make_tool_context(Some(registry), None);
+
+            let result = run_team_create_tool(
+                json!({
+                    "team_name": "mixed-providers-team",
+                    "task": "return your provider sentinel",
+                    "agents": [
+                        {
+                            "name": "agent-a",
+                            "task": "return the openai sentinel",
+                            "provider": "openai",
+                            "model": "gpt-4o"
+                        },
+                        {
+                            "name": "agent-b",
+                            "task": "return the google sentinel",
+                            "provider": "google",
+                            "model": "gemini-2.5-flash"
+                        }
+                    ]
+                }),
+                &ctx,
+            );
+
+            assert!(!result.is_error, "unexpected error: {}", result.content);
+
+            let payload: Value =
+                serde_json::from_str(&result.content).expect("team result should be valid JSON");
+            let results = payload["results"]
+                .as_array()
+                .expect("team results should be an array");
+
+            let agent_a_output = results
+                .iter()
+                .find(|entry| entry["agent"] == "agent-a")
+                .and_then(|entry| entry["output"].as_str())
+                .expect("agent-a output should be present");
+            let agent_b_output = results
+                .iter()
+                .find(|entry| entry["agent"] == "agent-b")
+                .and_then(|entry| entry["output"].as_str())
+                .expect("agent-b output should be present");
+
+            assert_eq!(agent_a_output, openai_sentinel);
+            assert_eq!(agent_b_output, google_sentinel);
+            assert_ne!(agent_a_output, google_sentinel);
+            assert_ne!(agent_b_output, openai_sentinel);
+            assert_eq!(openai_invocations.load(Ordering::SeqCst), 1);
+            assert_eq!(google_invocations.load(Ordering::SeqCst), 1);
         });
     }
 }
