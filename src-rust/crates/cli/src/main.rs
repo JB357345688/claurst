@@ -1123,7 +1123,7 @@ async fn run_headless(
 
     let query_handle = tokio::spawn(async move {
         claurst_query::run_query_loop(
-            client_clone.as_ref(),
+            Some(client_clone.as_ref()),
             &mut messages,
             tools.as_slice(),
             &tool_ctx_clone,
@@ -2084,7 +2084,7 @@ async fn run_interactive(
                         let handle = tokio::spawn(async move {
                             let mut msgs = msgs_arc_clone.lock().await.clone();
                             let outcome = claurst_query::run_query_loop(
-                                client_clone.as_ref(),
+                                Some(client_clone.as_ref()),
                                 &mut msgs,
                                 tools_arc_clone.as_slice(),
                                 &ctx_clone,
@@ -2290,7 +2290,7 @@ async fn run_interactive(
                 let handle = tokio::spawn(async move {
                     let mut msgs = msgs_arc_clone.lock().await.clone();
                     let outcome = claurst_query::run_query_loop(
-                        client_clone.as_ref(),
+                        Some(client_clone.as_ref()),
                         &mut msgs,
                         tools_arc_clone.as_slice(),
                         &ctx_clone,
@@ -2443,7 +2443,7 @@ async fn run_interactive(
                         let handle = tokio::spawn(async move {
                             let mut msgs = msgs_arc_clone.lock().await.clone();
                             let outcome = claurst_query::run_query_loop(
-                                client_clone.as_ref(),
+                                Some(client_clone.as_ref()),
                                 &mut msgs,
                                 tools_arc_clone.as_slice(),
                                 &ctx_clone,
@@ -2555,7 +2555,7 @@ async fn run_interactive(
                 let handle = tokio::spawn(async move {
                     let mut msgs = msgs_arc_clone.lock().await.clone();
                     let outcome = claurst_query::run_query_loop(
-                        client_clone.as_ref(),
+                        Some(client_clone.as_ref()),
                         &mut msgs,
                         tools_arc_clone.as_slice(),
                         &ctx_clone,

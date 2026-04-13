@@ -2104,6 +2104,14 @@ fn map_to_anthropic_event(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+pub(crate) fn provider_auth_test_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::OnceLock;
+
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use claurst_api::client::ClientConfig;
@@ -2112,7 +2120,7 @@ mod tests {
     use parking_lot::Mutex;
     use std::ffi::{OsStr, OsString};
     use std::sync::atomic::AtomicUsize;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn make_config(sys: Option<&str>, append: Option<&str>) -> QueryConfig {
@@ -2138,11 +2146,6 @@ mod tests {
             agent_definition: None,
             model_registry: None,
         }
-    }
-
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     struct EnvGuard {
@@ -2180,7 +2183,7 @@ mod tests {
     }
 
     fn with_isolated_provider_auth<T>(f: impl FnOnce() -> T) -> T {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = crate::provider_auth_test_lock().lock().unwrap();
         let home = TempDir::new().unwrap();
         let _home = EnvGuard::set_os("HOME", Some(home.path().as_os_str()));
         let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", None);

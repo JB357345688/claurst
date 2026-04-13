@@ -261,7 +261,7 @@ mod tests {
         collections::HashMap,
         ffi::{OsStr, OsString},
         future::Future,
-        sync::{Arc, Mutex, OnceLock},
+        sync::Arc,
     };
 
     use async_trait::async_trait;
@@ -342,11 +342,6 @@ mod tests {
         }
     }
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     struct EnvGuard {
         key: &'static str,
         original: Option<OsString>,
@@ -382,7 +377,7 @@ mod tests {
     }
 
     fn with_isolated_provider_auth<T>(f: impl FnOnce() -> T) -> T {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = crate::provider_auth_test_lock().lock().unwrap();
         let home = TempDir::new().unwrap();
         let _home = EnvGuard::set_os("HOME", Some(home.path().as_os_str()));
         let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", None);
@@ -716,8 +711,11 @@ mod tests {
     fn materialize_provider_applies_lm_studio_api_base_override() {
         with_isolated_provider_auth(|| {
             let _lm_studio_host = EnvGuard::set("LM_STUDIO_HOST", Some("http://localhost:bad"));
-            let identity =
-                provider_identity("lm-studio", "local-model", ResolutionSource::ExplicitProvider);
+            let identity = provider_identity(
+                "lm-studio",
+                "local-model",
+                ResolutionSource::ExplicitProvider,
+            );
             let registry = ProviderRegistry::new();
             let mut provider_configs = HashMap::new();
             provider_configs.insert(
@@ -745,8 +743,11 @@ mod tests {
     fn materialize_provider_applies_llama_cpp_api_base_override() {
         with_isolated_provider_auth(|| {
             let _llama_cpp_host = EnvGuard::set("LLAMA_CPP_HOST", Some("http://localhost:bad"));
-            let identity =
-                provider_identity("llama-cpp", "local-model", ResolutionSource::ExplicitProvider);
+            let identity = provider_identity(
+                "llama-cpp",
+                "local-model",
+                ResolutionSource::ExplicitProvider,
+            );
             let registry = ProviderRegistry::new();
             let mut provider_configs = HashMap::new();
             provider_configs.insert(

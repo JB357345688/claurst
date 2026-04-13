@@ -127,6 +127,10 @@ async fn remove_worktree(git_root: &Path, worktree_dir: &Path) {
 
 pub struct AgentTool;
 
+// D1-safe interim fallback for spawned child agents; this is not the final
+// parent/child max_tokens policy.
+const CHILD_AGENT_FALLBACK_MAX_TOKENS: u32 = 4_096;
+
 #[derive(Debug, Deserialize)]
 struct AgentInput {
     /// Short description of the agent's task (used for logging).
@@ -357,7 +361,7 @@ impl Tool for AgentTool {
 
         let query_config = QueryConfig {
             model: target.model_id.clone(),
-            max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
+            max_tokens: CHILD_AGENT_FALLBACK_MAX_TOKENS,
             max_turns: params.max_turns.unwrap_or(10),
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
@@ -537,8 +541,8 @@ fn format_outcome(outcome: QueryOutcome) -> String {
 /// # Panics
 /// Panics if the runner was already registered.
 pub fn init_team_swarm_runner() {
-    let runner: claurst_tools::AgentRunFn = Arc::new(
-        |params: claurst_tools::team_tool::AgentRunParams| {
+    let runner: claurst_tools::AgentRunFn =
+        Arc::new(|params: claurst_tools::team_tool::AgentRunParams| {
             // We must return a Pin<Box<dyn Future<...> + Send>>.
             Box::pin(async move {
                 let claurst_tools::team_tool::AgentRunParams {
@@ -615,7 +619,7 @@ pub fn init_team_swarm_runner() {
 
                 let query_config = QueryConfig {
                     model: target.model_id.clone(),
-                    max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
+                    max_tokens: CHILD_AGENT_FALLBACK_MAX_TOKENS,
                     max_turns: max_turns.unwrap_or(10),
                     system_prompt: Some(system_prompt),
                     working_directory: Some(ctx.working_dir.display().to_string()),
@@ -646,8 +650,7 @@ pub fn init_team_swarm_runner() {
 
                 format_outcome(outcome)
             }) as Pin<Box<dyn std::future::Future<Output = String> + Send>>
-        },
-    );
+        });
 
     claurst_tools::register_agent_runner(runner);
 }
@@ -823,11 +826,7 @@ mod tests {
     fn make_mixed_tracking_registry(
         openai_response_text: &str,
         google_response_text: &str,
-    ) -> (
-        Arc<ProviderRegistry>,
-        Arc<AtomicUsize>,
-        Arc<AtomicUsize>,
-    ) {
+    ) -> (Arc<ProviderRegistry>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let openai_invocations = Arc::new(AtomicUsize::new(0));
         let google_invocations = Arc::new(AtomicUsize::new(0));
         let mut registry = ProviderRegistry::new();
@@ -848,11 +847,6 @@ mod tests {
             google_response_text,
         )));
         (Arc::new(registry), openai_invocations, google_invocations)
-    }
-
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     struct EnvGuard {
@@ -890,7 +884,7 @@ mod tests {
     }
 
     fn with_isolated_provider_auth<T>(f: impl FnOnce() -> T) -> T {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = crate::provider_auth_test_lock().lock().unwrap();
         let home = TempDir::new().unwrap();
         let _home = EnvGuard::set_os("HOME", Some(home.path().as_os_str()));
         let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", None);
