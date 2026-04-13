@@ -2097,7 +2097,14 @@ fn map_to_anthropic_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claurst_api::client::ClientConfig;
     use claurst_api::SystemPrompt;
+    use claurst_core::permissions::AutoPermissionHandler;
+    use parking_lot::Mutex;
+    use std::ffi::{OsStr, OsString};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, OnceLock};
+    use tempfile::TempDir;
 
     fn make_config(sys: Option<&str>, append: Option<&str>) -> QueryConfig {
         QueryConfig {
@@ -2122,6 +2129,104 @@ mod tests {
             agent_definition: None,
             model_registry: None,
         }
+    }
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+
+        fn set_os(key: &'static str, value: Option<&OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn with_isolated_provider_auth<T>(f: impl FnOnce() -> T) -> T {
+        let _lock = env_lock().lock().unwrap();
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_os("HOME", Some(home.path().as_os_str()));
+        let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", None);
+        let _openai = EnvGuard::set("OPENAI_API_KEY", None);
+        f()
+    }
+
+    fn make_tool_context(parent_provider: Option<&str>) -> ToolContext {
+        let mut config = claurst_core::config::Config::default();
+        config.provider = parent_provider.map(str::to_string);
+
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_handler: Arc::new(AutoPermissionHandler {
+                mode: claurst_core::config::PermissionMode::Default,
+            }),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "query-root-legacy-test".to_string(),
+            file_history: Arc::new(Mutex::new(claurst_core::file_history::FileHistory::new())),
+            current_turn: Arc::new(AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config,
+            provider_registry: None,
+            model_registry: None,
+        }
+    }
+
+    fn run_root_query(config: QueryConfig, parent_provider: Option<&str>) -> QueryOutcome {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let client = claurst_api::AnthropicClient::new(ClientConfig::default()).unwrap();
+            let mut messages = vec![Message::user("verify legacy root path")];
+            let tools: Vec<Box<dyn Tool>> = vec![];
+            let tool_ctx = make_tool_context(parent_provider);
+            let cost_tracker = tool_ctx.cost_tracker.clone();
+
+            run_query_loop(
+                &client,
+                &mut messages,
+                &tools,
+                &tool_ctx,
+                &config,
+                cost_tracker,
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await
+        })
     }
 
     // ---- build_system_prompt tests ------------------------------------------
@@ -2248,6 +2353,35 @@ mod tests {
         let err_outcome = QueryOutcome::Error(claurst_core::error::ClaudeError::RateLimit);
         let s2 = format!("{:?}", err_outcome);
         assert!(s2.contains("Error"));
+    }
+
+    #[test]
+    fn provider_registry_none_uses_legacy_anthropic_client_path() {
+        with_isolated_provider_auth(|| {
+            let mut config = make_config(None, None);
+            config.model = "gpt-4o".to_string();
+
+            let err_text = match run_root_query(config, Some("openai")) {
+                QueryOutcome::Error(err) => err.to_string(),
+                other => panic!("expected root legacy auth error, got {:?}", other),
+            };
+
+            assert!(
+                err_text.contains("Authentication error: No API key for the selected model."),
+                "unexpected error: {}",
+                err_text
+            );
+            assert!(
+                err_text.contains("Model 'gpt-4o' is an OpenAI model."),
+                "unexpected error: {}",
+                err_text
+            );
+            assert!(
+                err_text.contains("Use `--provider openai` or set OPENAI_API_KEY."),
+                "unexpected error: {}",
+                err_text
+            );
+        });
     }
 
     #[test]
