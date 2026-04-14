@@ -18,6 +18,7 @@ pub mod coordinator;
 pub mod cron_scheduler;
 pub mod health_cache;
 pub mod provider_resolution;
+pub mod session_budget;
 pub mod session_memory;
 pub mod skill_prefetch;
 pub use agent_tool::{init_team_swarm_runner, AgentTool};
@@ -32,6 +33,7 @@ pub use compact::{
 pub use cron_scheduler::start_cron_scheduler;
 pub use health_cache::*;
 pub use provider_resolution::*;
+pub use session_budget::*;
 pub use session_memory::{
     ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
 };
