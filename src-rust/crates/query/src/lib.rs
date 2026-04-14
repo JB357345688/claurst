@@ -16,6 +16,7 @@ pub mod compact;
 pub mod context_analyzer;
 pub mod coordinator;
 pub mod cron_scheduler;
+pub mod health_cache;
 pub mod provider_resolution;
 pub mod session_memory;
 pub mod skill_prefetch;
@@ -29,6 +30,7 @@ pub use compact::{
     CompactResult, CompactTrigger, MessageGroup, MicroCompactConfig, TokenWarningState,
 };
 pub use cron_scheduler::start_cron_scheduler;
+pub use health_cache::*;
 pub use provider_resolution::*;
 pub use session_memory::{
     ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
