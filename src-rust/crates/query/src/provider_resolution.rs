@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use claurst_api::{LlmProvider, ModelRegistry, ProviderRegistry};
+use claurst_api::{LlmProvider, ModelEntry, ModelRegistry, ProviderCapabilities, ProviderRegistry};
 use claurst_core::{config::ProviderConfig, AuthStore, ProviderId};
 
 pub const KNOWN_PROVIDERS: &[&str] = &[
@@ -45,6 +45,40 @@ pub const KNOWN_PROVIDERS: &[&str] = &[
     "upstage",
     "stepfun",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    ToolCalling,
+    Reasoning,
+    Vision,
+    PdfInput,
+    AudioInput,
+    StructuredOutput,
+}
+
+pub const DEFAULT_REQUIRED_CAPABILITIES: &[Capability] = &[Capability::ToolCalling];
+
+pub fn model_supports_capability(entry: &ModelEntry, cap: &Capability) -> Option<bool> {
+    match cap {
+        Capability::ToolCalling => Some(entry.tool_calling),
+        Capability::Reasoning => Some(entry.reasoning),
+        Capability::Vision => Some(entry.vision),
+        Capability::PdfInput => entry.pdf_input,
+        Capability::AudioInput => entry.audio_input,
+        Capability::StructuredOutput => entry.structured_output,
+    }
+}
+
+pub fn provider_supports_capability(caps: &ProviderCapabilities, cap: &Capability) -> bool {
+    match cap {
+        Capability::ToolCalling => caps.tool_calling,
+        Capability::Reasoning => caps.thinking,
+        Capability::Vision => caps.image_input,
+        Capability::PdfInput => caps.pdf_input,
+        Capability::AudioInput => caps.audio_input,
+        Capability::StructuredOutput => caps.structured_output,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolutionSource {
@@ -254,8 +288,10 @@ fn normalize_ollama_api_base(api_base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        materialize_provider, normalize_ollama_api_base, resolve_provider_identity,
-        ProviderIdentity, ProviderResolutionError, ResolutionSource,
+        materialize_provider, model_supports_capability, normalize_ollama_api_base,
+        provider_supports_capability, resolve_provider_identity, Capability,
+        DEFAULT_REQUIRED_CAPABILITIES, ProviderIdentity, ProviderResolutionError,
+        ResolutionSource,
     };
     use std::{
         collections::HashMap,
@@ -266,10 +302,10 @@ mod tests {
 
     use async_trait::async_trait;
     use claurst_api::{
-        LlmProvider, ModelRegistry, OpenAiProvider, ProviderCapabilities, ProviderError,
-        ProviderRegistry, ProviderStatus, SystemPromptStyle,
+        LlmProvider, ModelEntry, ModelInfo, ModelRegistry, OpenAiProvider, ProviderCapabilities,
+        ProviderError, ProviderRegistry, ProviderStatus, SystemPromptStyle,
     };
-    use claurst_core::{config::ProviderConfig, AuthStore, ProviderId, StoredCredential};
+    use claurst_core::{config::ProviderConfig, AuthStore, ModelId, ProviderId, StoredCredential};
     use tempfile::TempDir;
 
     struct TestProvider {
@@ -454,6 +490,31 @@ mod tests {
         }
     }
 
+    fn test_model_entry() -> ModelEntry {
+        ModelEntry {
+            info: ModelInfo {
+                id: ModelId::new("test-model"),
+                provider_id: ProviderId::new("test-provider"),
+                name: "Test Model".to_string(),
+                context_window: 128_000,
+                max_output_tokens: 4_096,
+            },
+            cost_input: None,
+            cost_output: None,
+            cost_cache_read: None,
+            cost_cache_write: None,
+            tool_calling: false,
+            reasoning: false,
+            vision: false,
+            pdf_input: None,
+            audio_input: None,
+            structured_output: None,
+            max_output_tokens: None,
+            family: None,
+            status: "active".to_string(),
+        }
+    }
+
     #[test]
     fn normalize_ollama_api_base_rewrites_hosted_api_root() {
         assert_eq!(
@@ -622,6 +683,79 @@ mod tests {
             "llama3",
             ResolutionSource::ExplicitProvider,
         );
+    }
+
+    #[test]
+    fn default_required_capabilities_contains_tool_calling_capability() {
+        assert_eq!(DEFAULT_REQUIRED_CAPABILITIES, &[Capability::ToolCalling]);
+    }
+
+    #[test]
+    fn model_supports_capability_returns_known_bool_capabilities() {
+        let mut entry = test_model_entry();
+        entry.tool_calling = true;
+        entry.reasoning = false;
+        entry.vision = true;
+
+        assert_eq!(
+            model_supports_capability(&entry, &Capability::ToolCalling),
+            Some(true)
+        );
+        assert_eq!(
+            model_supports_capability(&entry, &Capability::Reasoning),
+            Some(false)
+        );
+        assert_eq!(
+            model_supports_capability(&entry, &Capability::Vision),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn model_supports_capability_returns_optional_capability_values() {
+        let mut entry = test_model_entry();
+        entry.pdf_input = Some(true);
+        entry.audio_input = Some(false);
+        entry.structured_output = None;
+
+        assert_eq!(
+            model_supports_capability(&entry, &Capability::PdfInput),
+            Some(true)
+        );
+        assert_eq!(
+            model_supports_capability(&entry, &Capability::AudioInput),
+            Some(false)
+        );
+        assert_eq!(
+            model_supports_capability(&entry, &Capability::StructuredOutput),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_supports_capability_maps_provider_capability_fields() {
+        let caps = ProviderCapabilities {
+            streaming: false,
+            tool_calling: true,
+            thinking: false,
+            image_input: true,
+            pdf_input: false,
+            audio_input: true,
+            video_input: false,
+            caching: false,
+            structured_output: true,
+            system_prompt_style: SystemPromptStyle::SystemMessage,
+        };
+
+        assert!(provider_supports_capability(&caps, &Capability::ToolCalling));
+        assert!(!provider_supports_capability(&caps, &Capability::Reasoning));
+        assert!(provider_supports_capability(&caps, &Capability::Vision));
+        assert!(!provider_supports_capability(&caps, &Capability::PdfInput));
+        assert!(provider_supports_capability(&caps, &Capability::AudioInput));
+        assert!(provider_supports_capability(
+            &caps,
+            &Capability::StructuredOutput
+        ));
     }
 
     #[test]
