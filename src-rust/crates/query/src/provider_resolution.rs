@@ -1,7 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
-use claurst_api::{LlmProvider, ModelEntry, ModelRegistry, ProviderCapabilities, ProviderRegistry};
+use claurst_api::{
+    LlmProvider, ModelEntry, ModelRegistry, ProviderCapabilities, ProviderRegistry, TrustDomain,
+};
 use claurst_core::{config::ProviderConfig, AuthStore, ProviderId};
+
+use crate::HealthCache;
 
 pub const KNOWN_PROVIDERS: &[&str] = &[
     "anthropic",
@@ -130,6 +134,8 @@ pub enum ProviderResolutionError {
     },
     #[error("Provider '{0}' is unavailable")]
     ProviderUnavailable(String),
+    #[error("{0}. Try allow_fallback: true")]
+    FallbackDisabled(String),
 }
 
 pub fn resolve_provider_identity(
@@ -248,6 +254,139 @@ pub fn materialize_provider(
     })
 }
 
+fn supports_required_capabilities(
+    entry: Option<&ModelEntry>,
+    provider_caps: &ProviderCapabilities,
+    required_capabilities: &[Capability],
+) -> bool {
+    required_capabilities.iter().all(|cap| {
+        entry
+            .and_then(|entry| model_supports_capability(entry, cap))
+            .unwrap_or_else(|| provider_supports_capability(provider_caps, cap))
+    })
+}
+
+fn select_fallback_model(
+    model_registry: Option<&ModelRegistry>,
+    primary_identity: &ProviderIdentity,
+    candidate_provider_id: &str,
+    provider_caps: &ProviderCapabilities,
+) -> Option<String> {
+    let model_registry = model_registry?;
+    let original_family = model_registry
+        .get(&primary_identity.provider_id, &primary_identity.model_id)
+        .and_then(|entry| entry.family.as_deref());
+
+    if let Some(family) = original_family {
+        let mut family_matches = model_registry
+            .list_by_provider(candidate_provider_id)
+            .into_iter()
+            .filter(|entry| entry.family.as_deref() == Some(family))
+            .filter(|entry| {
+                supports_required_capabilities(Some(entry), provider_caps, DEFAULT_REQUIRED_CAPABILITIES)
+            })
+            .collect::<Vec<_>>();
+        family_matches.sort_by(|a, b| (&*b.info.id).cmp(&*a.info.id));
+
+        if let Some(entry) = family_matches.first() {
+            return Some(entry.info.id.to_string());
+        }
+    }
+
+    let default_model_id = model_registry.best_model_for_provider(candidate_provider_id)?;
+    let default_entry = model_registry.get(candidate_provider_id, &default_model_id);
+    supports_required_capabilities(default_entry, provider_caps, DEFAULT_REQUIRED_CAPABILITIES)
+        .then_some(default_model_id)
+}
+
+pub async fn resolve_provider_with_fallback(
+    explicit_provider: Option<&str>,
+    model: &str,
+    model_registry: Option<&ModelRegistry>,
+    provider_registry: &ProviderRegistry,
+    provider_configs: &HashMap<String, ProviderConfig>,
+    health_cache: &HealthCache,
+    allow_fallback: bool,
+) -> Result<ExecutionTarget, ProviderResolutionError> {
+    let identity = resolve_provider_identity(explicit_provider, model, model_registry)?;
+
+    let direct_error = match materialize_provider(&identity, provider_registry, provider_configs) {
+        Ok(target) => return Ok(target),
+        Err(error) => error,
+    };
+
+    if !allow_fallback {
+        return Err(ProviderResolutionError::FallbackDisabled(
+            direct_error.to_string(),
+        ));
+    }
+
+    let primary_domain = TrustDomain::for_provider(&identity.provider_id);
+    let mut healthy_candidates = Vec::new();
+    let mut degraded_candidates = Vec::new();
+
+    for candidate_id in provider_registry.provider_ids() {
+        let candidate_provider_id = candidate_id.to_string();
+        if candidate_provider_id == identity.provider_id {
+            continue;
+        }
+        if TrustDomain::for_provider(&candidate_provider_id) != primary_domain {
+            continue;
+        }
+
+        let Some(provider) = provider_registry.get(candidate_id) else {
+            continue;
+        };
+
+        match health_cache
+            .probe_if_stale(&candidate_provider_id, provider.as_ref())
+            .await
+        {
+            claurst_api::ProviderStatus::Healthy => healthy_candidates.push(candidate_provider_id),
+            claurst_api::ProviderStatus::Degraded { .. } => {
+                degraded_candidates.push(candidate_provider_id)
+            }
+            claurst_api::ProviderStatus::Unavailable { .. } => {}
+        }
+    }
+
+    for candidate_provider_id in healthy_candidates
+        .into_iter()
+        .chain(degraded_candidates.into_iter())
+    {
+        let candidate_pid = ProviderId::new(candidate_provider_id.as_str());
+        let Some(provider) = provider_registry.get(&candidate_pid) else {
+            continue;
+        };
+
+        let provider_caps = provider.capabilities();
+        let Some(candidate_model_id) = select_fallback_model(
+            model_registry,
+            &identity,
+            &candidate_provider_id,
+            &provider_caps,
+        ) else {
+            continue;
+        };
+
+        let fallback_identity = ProviderIdentity {
+            provider_id: candidate_provider_id.clone(),
+            model_id: candidate_model_id,
+            resolution_source: ResolutionSource::ModelRegistry,
+        };
+
+        if let Ok(target) = materialize_provider(
+            &fallback_identity,
+            provider_registry,
+            provider_configs,
+        ) {
+            return Ok(target);
+        }
+    }
+
+    Err(direct_error)
+}
+
 fn build_ollama_provider(
     provider_configs: &HashMap<String, ProviderConfig>,
 ) -> claurst_api::providers::openai_compat::OpenAiCompatProvider {
@@ -289,8 +428,8 @@ fn normalize_ollama_api_base(api_base: &str) -> String {
 mod tests {
     use super::{
         materialize_provider, model_supports_capability, normalize_ollama_api_base,
-        provider_supports_capability, resolve_provider_identity, Capability,
-        DEFAULT_REQUIRED_CAPABILITIES, ProviderIdentity, ProviderResolutionError,
+        provider_supports_capability, resolve_provider_identity, resolve_provider_with_fallback,
+        Capability, DEFAULT_REQUIRED_CAPABILITIES, ProviderIdentity, ProviderResolutionError,
         ResolutionSource,
     };
     use std::{
@@ -307,10 +446,13 @@ mod tests {
     };
     use claurst_core::{config::ProviderConfig, AuthStore, ModelId, ProviderId, StoredCredential};
     use tempfile::TempDir;
+    use crate::HealthCache;
 
     struct TestProvider {
         id: ProviderId,
         name: String,
+        health_status: ProviderStatus,
+        capabilities: ProviderCapabilities,
     }
 
     impl TestProvider {
@@ -318,7 +460,30 @@ mod tests {
             Self {
                 id: ProviderId::new(id),
                 name: name.to_string(),
+                health_status: ProviderStatus::Healthy,
+                capabilities: ProviderCapabilities {
+                    streaming: false,
+                    tool_calling: false,
+                    thinking: false,
+                    image_input: false,
+                    pdf_input: false,
+                    audio_input: false,
+                    video_input: false,
+                    caching: false,
+                    structured_output: false,
+                    system_prompt_style: SystemPromptStyle::SystemMessage,
+                },
             }
+        }
+
+        fn with_health_status(mut self, health_status: ProviderStatus) -> Self {
+            self.health_status = health_status;
+            self
+        }
+
+        fn with_capabilities(mut self, capabilities: ProviderCapabilities) -> Self {
+            self.capabilities = capabilities;
+            self
         }
     }
 
@@ -359,22 +524,11 @@ mod tests {
         }
 
         async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
-            Ok(ProviderStatus::Healthy)
+            Ok(self.health_status.clone())
         }
 
         fn capabilities(&self) -> ProviderCapabilities {
-            ProviderCapabilities {
-                streaming: false,
-                tool_calling: false,
-                thinking: false,
-                image_input: false,
-                pdf_input: false,
-                audio_input: false,
-                video_input: false,
-                caching: false,
-                structured_output: false,
-                system_prompt_style: SystemPromptStyle::SystemMessage,
-            }
+            self.capabilities.clone()
         }
     }
 
@@ -418,6 +572,8 @@ mod tests {
         let _home = EnvGuard::set_os("HOME", Some(home.path().as_os_str()));
         let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", None);
         let _openai = EnvGuard::set("OPENAI_API_KEY", None);
+        let _google = EnvGuard::set("GOOGLE_API_KEY", None);
+        let _google_genai = EnvGuard::set("GOOGLE_GENERATIVE_AI_API_KEY", None);
         let _ollama = EnvGuard::set("OLLAMA_API_KEY", None);
         let _lm_studio = EnvGuard::set("LM_STUDIO_HOST", None);
         let _llama_cpp = EnvGuard::set("LLAMA_CPP_HOST", None);
@@ -512,6 +668,21 @@ mod tests {
             max_output_tokens: None,
             family: None,
             status: "active".to_string(),
+        }
+    }
+
+    fn tool_calling_capabilities() -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            tool_calling: true,
+            thinking: false,
+            image_input: false,
+            pdf_input: false,
+            audio_input: false,
+            video_input: false,
+            caching: false,
+            structured_output: false,
+            system_prompt_style: SystemPromptStyle::SystemMessage,
         }
     }
 
@@ -918,6 +1089,98 @@ mod tests {
             assert!(matches!(
                 error,
                 ProviderResolutionError::NoCredentials(provider) if provider == "openai"
+            ));
+        });
+    }
+
+    #[test]
+    fn fallback_disabled_returns_suggestion_text() {
+        with_isolated_provider_auth(|| {
+            let model_registry = ModelRegistry::new();
+            let registry = ProviderRegistry::new();
+            let health_cache = HealthCache::new();
+
+            let error = run_async(resolve_provider_with_fallback(
+                Some("openai"),
+                "gpt-4o",
+                Some(&model_registry),
+                &registry,
+                &HashMap::new(),
+                &health_cache,
+                false,
+            ))
+            .expect_err("fallback-disabled resolution should fail");
+
+            assert!(matches!(
+                error,
+                ProviderResolutionError::FallbackDisabled(_)
+            ));
+            assert!(error.to_string().contains("allow_fallback: true"));
+        });
+    }
+
+    #[test]
+    fn fallback_same_domain_returns_healthy_cloud_candidate() {
+        with_isolated_provider_auth(|| {
+            let model_registry = ModelRegistry::new();
+            let health_cache = HealthCache::new();
+            let mut registry = ProviderRegistry::new();
+            registry.register(Arc::new(
+                TestProvider::new("openai", "OpenAI")
+                    .with_health_status(ProviderStatus::Degraded {
+                        reason: "slow".to_string(),
+                    })
+                    .with_capabilities(tool_calling_capabilities()),
+            ));
+            registry.register(Arc::new(
+                TestProvider::new("google", "Google")
+                    .with_health_status(ProviderStatus::Healthy)
+                    .with_capabilities(tool_calling_capabilities()),
+            ));
+
+            let target = run_async(resolve_provider_with_fallback(
+                Some("anthropic"),
+                "claude-sonnet-4-6",
+                Some(&model_registry),
+                &registry,
+                &HashMap::new(),
+                &health_cache,
+                true,
+            ))
+            .expect("same-domain fallback should succeed");
+
+            assert_eq!(target.provider_id, "google");
+            assert_eq!(target.model_id, "gemini-2.5-pro");
+            assert_eq!(target.resolution_source, ResolutionSource::ModelRegistry);
+        });
+    }
+
+    #[test]
+    fn fallback_cross_domain_is_prohibited() {
+        with_isolated_provider_auth(|| {
+            let model_registry = ModelRegistry::new();
+            let health_cache = HealthCache::new();
+            let mut registry = ProviderRegistry::new();
+            registry.register(Arc::new(
+                TestProvider::new("google", "Google")
+                    .with_health_status(ProviderStatus::Healthy)
+                    .with_capabilities(tool_calling_capabilities()),
+            ));
+
+            let error = run_async(resolve_provider_with_fallback(
+                Some("lm-studio"),
+                "local-model",
+                Some(&model_registry),
+                &registry,
+                &HashMap::new(),
+                &health_cache,
+                true,
+            ))
+            .expect_err("cross-domain fallback should not succeed");
+
+            assert!(matches!(
+                error,
+                ProviderResolutionError::NoCredentials(provider) if provider == "lm-studio"
             ));
         });
     }
