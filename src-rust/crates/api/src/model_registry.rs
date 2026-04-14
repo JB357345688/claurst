@@ -37,6 +37,14 @@ pub struct ModelEntry {
     pub reasoning: bool,
     /// Supports vision / image input.
     pub vision: bool,
+    #[serde(default)]
+    pub pdf_input: Option<bool>,
+    #[serde(default)]
+    pub audio_input: Option<bool>,
+    #[serde(default)]
+    pub structured_output: Option<bool>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
     /// Model family (e.g. `"claude"`, `"gpt"`, `"gemini"`).
     pub family: Option<String>,
     /// Human-readable status: `"active"`, `"beta"`, or `"deprecated"`.
@@ -130,6 +138,10 @@ impl ModelRegistry {
                 tool_calling: true,
                 reasoning: true,
                 vision: true,
+                pdf_input: None,
+                audio_input: None,
+                structured_output: None,
+                max_output_tokens: None,
                 family: Some("claude".to_string()),
                 status: "active".to_string(),
             });
@@ -170,6 +182,10 @@ impl ModelRegistry {
                 tool_calling: tools,
                 reasoning,
                 vision: true,
+                pdf_input: None,
+                audio_input: None,
+                structured_output: None,
+                max_output_tokens: None,
                 family: Some("gpt".to_string()),
                 status: "active".to_string(),
             });
@@ -219,6 +235,10 @@ impl ModelRegistry {
                 tool_calling: true,
                 reasoning: true,
                 vision: true,
+                pdf_input: None,
+                audio_input: None,
+                structured_output: None,
+                max_output_tokens: None,
                 family: Some("gemini".to_string()),
                 status: "active".to_string(),
             });
@@ -542,6 +562,10 @@ impl ModelRegistry {
                                 tool_calling,
                                 reasoning,
                                 vision: false,
+                                pdf_input: None,
+                                audio_input: None,
+                                structured_output: None,
+                                max_output_tokens: None,
                                 family: None,
                                 status: "active".to_string(),
                             },
