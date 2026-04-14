@@ -2853,6 +2853,8 @@ pub mod cost {
         cache_creation_tokens: AtomicU64,
         cache_read_tokens: AtomicU64,
         pricing: parking_lot::RwLock<ModelPricing>,
+        agent_id: parking_lot::RwLock<Option<String>>,
+        provider_id: parking_lot::RwLock<Option<String>>,
     }
 
     // We need a default for RwLock<ModelPricing> -- use Opus as default.
@@ -2860,6 +2862,8 @@ pub mod cost {
         pub fn new() -> Arc<Self> {
             Arc::new(Self {
                 pricing: parking_lot::RwLock::new(ModelPricing::OPUS),
+                agent_id: parking_lot::RwLock::new(None),
+                provider_id: parking_lot::RwLock::new(None),
                 ..Default::default()
             })
         }
@@ -2867,12 +2871,22 @@ pub mod cost {
         pub fn with_model(model: &str) -> Arc<Self> {
             Arc::new(Self {
                 pricing: parking_lot::RwLock::new(ModelPricing::for_model(model)),
+                agent_id: parking_lot::RwLock::new(None),
+                provider_id: parking_lot::RwLock::new(None),
                 ..Default::default()
             })
         }
 
         pub fn set_model(&self, model: &str) {
             *self.pricing.write() = ModelPricing::for_model(model);
+        }
+
+        pub fn set_agent_id(&self, id: String) {
+            *self.agent_id.write() = Some(id);
+        }
+
+        pub fn set_provider_id(&self, id: String) {
+            *self.provider_id.write() = Some(id);
         }
 
         pub fn add_usage(&self, input: u64, output: u64, cache_creation: u64, cache_read: u64) {
