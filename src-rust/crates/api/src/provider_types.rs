@@ -240,6 +240,26 @@ pub enum ProviderStatus {
 // AuthMethod
 // ---------------------------------------------------------------------------
 
+/// Whether a provider is expected to run locally or in the cloud.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustDomain {
+    Local,
+    Cloud,
+}
+
+impl TrustDomain {
+    /// Classifies providers using the hardcoded D2 trust-domain baseline.
+    pub fn for_provider(provider_id: &str) -> TrustDomain {
+        match provider_id {
+            "ollama" | "lmstudio" | "lm-studio" | "llamacpp" | "llama-cpp" => {
+                TrustDomain::Local
+            }
+            _ => TrustDomain::Cloud,
+        }
+    }
+}
+
 /// The authentication mechanism used to talk to a provider endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
