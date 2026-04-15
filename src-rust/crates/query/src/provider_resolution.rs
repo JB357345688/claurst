@@ -290,7 +290,7 @@ fn select_fallback_model(
                 )
             })
             .collect::<Vec<_>>();
-        family_matches.sort_by(|a, b| (&*b.info.id).cmp(&*a.info.id));
+        family_matches.sort_by(|a, b| (*b.info.id).cmp(&*a.info.id));
 
         if let Some(entry) = family_matches.first() {
             return Some(entry.info.id.to_string());

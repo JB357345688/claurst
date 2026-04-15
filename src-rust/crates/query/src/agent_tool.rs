@@ -143,7 +143,7 @@ fn inherited_child_cancel_token(
 ) -> CancellationToken {
     session_budget
         .map(|budget| budget.child_cancel_token())
-        .unwrap_or_else(CancellationToken::new)
+        .unwrap_or_default()
 }
 
 fn child_session_budget(
@@ -429,7 +429,7 @@ impl Tool for AgentTool {
                     if let Ok(entries) = std::fs::read_dir(&agent_dir) {
                         for entry in entries.flatten() {
                             let p = entry.path();
-                            if p.extension().map_or(false, |e| e == "md") {
+                            if p.extension().is_some_and(|e| e == "md") {
                                 if let Ok(content) = std::fs::read_to_string(&p) {
                                     let name =
                                         p.file_stem().and_then(|s| s.to_str()).unwrap_or("agent");
@@ -870,8 +870,10 @@ mod tests {
         model_registry: Option<Arc<ModelRegistry>>,
         parent_provider: Option<&str>,
     ) -> ToolContext {
-        let mut config = Config::default();
-        config.provider = parent_provider.map(str::to_string);
+        let config = Config {
+            provider: parent_provider.map(str::to_string),
+            ..Default::default()
+        };
 
         ToolContext {
             working_dir: std::env::temp_dir(),
@@ -1030,16 +1032,18 @@ mod tests {
         (Arc::new(registry), invocations, observed_max_tokens)
     }
 
-    fn make_mixed_tracking_registry(
-        openai_response_text: &str,
-        google_response_text: &str,
-    ) -> (
+    type MixedTrackingRegistry = (
         Arc<ProviderRegistry>,
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
         Arc<Mutex<Vec<u32>>>,
         Arc<Mutex<Vec<u32>>>,
-    ) {
+    );
+
+    fn make_mixed_tracking_registry(
+        openai_response_text: &str,
+        google_response_text: &str,
+    ) -> MixedTrackingRegistry {
         let openai_invocations = Arc::new(AtomicUsize::new(0));
         let google_invocations = Arc::new(AtomicUsize::new(0));
         let openai_max_tokens = Arc::new(Mutex::new(Vec::new()));
