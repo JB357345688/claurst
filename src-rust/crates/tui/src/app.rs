@@ -5552,6 +5552,10 @@ impl App {
                 self.refresh_turn_diff_from_history();
             }
 
+            QueryEvent::WorkerProviderResolved { .. }
+            | QueryEvent::WorkerBudgetExceeded { .. }
+            | QueryEvent::SessionBudgetExceeded { .. } => {}
+
             QueryEvent::TurnComplete {
                 turn,
                 stop_reason,

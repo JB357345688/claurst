@@ -66,6 +66,18 @@ impl SessionBudget {
         self.root_token.is_cancelled()
     }
 
+    pub fn limit_usd(&self) -> f64 {
+        self.budget_usd
+    }
+
+    pub fn spent_usd(&self) -> f64 {
+        *self.spent.lock()
+    }
+
+    pub fn is_limit_exceeded(&self) -> bool {
+        self.spent_usd() >= self.budget_usd
+    }
+
     pub fn shared_budget(self: &Arc<Self>) -> Arc<Self> {
         self.parent
             .as_ref()

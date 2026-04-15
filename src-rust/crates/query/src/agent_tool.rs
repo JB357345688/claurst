@@ -28,7 +28,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::provider_resolution::{resolve_provider_with_fallback, KNOWN_PROVIDERS};
+use crate::provider_resolution::{
+    resolve_provider_identity, resolve_provider_with_fallback, ExecutionTarget, KNOWN_PROVIDERS,
+};
 use crate::{
     run_query_loop, session_budget_for_session, HealthCache, QueryConfig, QueryOutcome,
 };
@@ -130,6 +132,9 @@ pub struct AgentTool;
 // D1-safe interim fallback for spawned child agents; this is not the final
 // parent/child max_tokens policy.
 const CHILD_AGENT_FALLBACK_MAX_TOKENS: u32 = 4_096;
+pub(crate) const TOOL_OBSERVABILITY_EVENTS_KEY: &str = "query_observability_events";
+pub(crate) const TEAM_RUNNER_OBSERVABILITY_PREFIX: &str = "\n\n[[CLAURST_QUERY_OBS:";
+pub(crate) const TEAM_RUNNER_OBSERVABILITY_SUFFIX: &str = "]]";
 
 fn inherited_session_budget(
     session_id: &str,
@@ -155,6 +160,72 @@ fn child_session_budget(
         }
         (None, Some(usd)) => Some(Arc::new(crate::SessionBudget::new(usd))),
         (inherited_budget, None) => inherited_budget,
+    }
+}
+
+fn worker_provider_resolved_event(
+    agent_id: &str,
+    requested_provider_id: &str,
+    requested_model_id: &str,
+    target: &ExecutionTarget,
+) -> Value {
+    json!({
+        "type": "worker_provider_resolved",
+        "agent_id": agent_id,
+        "provider_id": target.provider_id,
+        "model_id": target.model_id,
+        "was_fallback": target.provider_id != requested_provider_id
+            || target.model_id != requested_model_id,
+    })
+}
+
+fn worker_budget_exceeded_event(
+    agent_id: &str,
+    session_budget: Option<&Arc<crate::SessionBudget>>,
+    budget_usd: Option<f64>,
+) -> Option<Value> {
+    let session_budget = session_budget?;
+    budget_usd?;
+
+    if session_budget.is_limit_exceeded() {
+        Some(json!({
+            "type": "worker_budget_exceeded",
+            "agent_id": agent_id,
+            "cost_usd": session_budget.spent_usd(),
+            "limit_usd": session_budget.limit_usd(),
+        }))
+    } else {
+        None
+    }
+}
+
+fn build_observability_metadata(events: Vec<Value>) -> Option<Value> {
+    if events.is_empty() {
+        None
+    } else {
+        Some(json!({
+            TOOL_OBSERVABILITY_EVENTS_KEY: events,
+        }))
+    }
+}
+
+fn attach_observability(mut result: ToolResult, events: Vec<Value>) -> ToolResult {
+    if let Some(metadata) = build_observability_metadata(events) {
+        result = result.with_metadata(metadata);
+    }
+    result
+}
+
+fn encode_team_runner_observability(content: String, events: Vec<Value>) -> String {
+    match build_observability_metadata(events) {
+        Some(metadata) => format!(
+            "{}{}{}{}",
+            content,
+            TEAM_RUNNER_OBSERVABILITY_PREFIX,
+            metadata,
+            TEAM_RUNNER_OBSERVABILITY_SUFFIX
+        ),
+        None => content,
     }
 }
 
@@ -318,6 +389,14 @@ impl Tool for AgentTool {
         } else {
             parent_provider
         };
+        let requested_identity = match resolve_provider_identity(
+            provider_hint,
+            &model,
+            ctx.model_registry.as_deref(),
+        ) {
+            Ok(identity) => identity,
+            Err(e) => return ToolResult::error(format!("Provider resolution failed: {}", e)),
+        };
 
         let registry = match ctx.provider_registry.as_ref() {
             Some(registry) => registry,
@@ -387,6 +466,12 @@ impl Tool for AgentTool {
         // -----------------------------------------------------------------------
         let use_isolation = params.isolation.as_deref() == Some("worktree");
         let agent_id = uuid::Uuid::new_v4().to_string();
+        let provider_event = worker_provider_resolved_event(
+            &agent_id,
+            &requested_identity.provider_id,
+            &requested_identity.model_id,
+            &target,
+        );
 
         let (working_dir_str, worktree_path, git_root): (String, Option<PathBuf>, Option<PathBuf>) =
             if use_isolation {
@@ -496,7 +581,8 @@ impl Tool for AgentTool {
                 let _ = tx.send(result_text);
             });
 
-            return ToolResult::success(
+            return attach_observability(
+                ToolResult::success(
                 serde_json::json!({
                     "agent_id": agent_id,
                     "status": "running",
@@ -506,6 +592,8 @@ impl Tool for AgentTool {
                     )
                 })
                 .to_string(),
+                ),
+                vec![provider_event],
             );
         }
 
@@ -533,6 +621,15 @@ impl Tool for AgentTool {
             remove_worktree(&root, &wt).await;
         }
 
+        let mut observability_events = vec![provider_event];
+        if let Some(event) = worker_budget_exceeded_event(
+            &agent_id,
+            session_budget.as_ref(),
+            params.budget_usd,
+        ) {
+            observability_events.push(event);
+        }
+
         match outcome {
             QueryOutcome::EndTurn { message, usage } => {
                 let text = message.get_all_text();
@@ -541,23 +638,35 @@ impl Tool for AgentTool {
                     output_tokens = usage.output_tokens,
                     "Sub-agent completed"
                 );
-                ToolResult::success(text)
+                attach_observability(ToolResult::success(text), observability_events)
             }
             QueryOutcome::MaxTokens {
                 partial_message, ..
             } => {
                 let text = partial_message.get_all_text();
-                ToolResult::success(format!("{}\n\n[Note: Agent hit max_tokens limit]", text))
+                attach_observability(
+                    ToolResult::success(format!("{}\n\n[Note: Agent hit max_tokens limit]", text)),
+                    observability_events,
+                )
             }
-            QueryOutcome::Cancelled => ToolResult::error("Sub-agent was cancelled".to_string()),
-            QueryOutcome::Error(e) => ToolResult::error(format!("Sub-agent error: {}", e)),
+            QueryOutcome::Cancelled => attach_observability(
+                ToolResult::error("Sub-agent was cancelled".to_string()),
+                observability_events,
+            ),
+            QueryOutcome::Error(e) => attach_observability(
+                ToolResult::error(format!("Sub-agent error: {}", e)),
+                observability_events,
+            ),
             QueryOutcome::BudgetExceeded {
                 cost_usd,
                 limit_usd,
-            } => ToolResult::error(format!(
-                "Sub-agent stopped: budget ${:.4} exceeded (limit ${:.4})",
-                cost_usd, limit_usd
-            )),
+            } => attach_observability(
+                ToolResult::error(format!(
+                    "Sub-agent stopped: budget ${:.4} exceeded (limit ${:.4})",
+                    cost_usd, limit_usd
+                )),
+                observability_events,
+            ),
         }
     }
 }
@@ -647,6 +756,19 @@ pub fn init_team_swarm_runner() {
                 let model = model_override
                     .filter(|m| !m.is_empty())
                     .unwrap_or_else(|| claurst_core::constants::DEFAULT_MODEL.to_string());
+                let requested_identity = match resolve_provider_identity(
+                    provider_override.as_deref().filter(|p| !p.is_empty()),
+                    &model,
+                    ctx.model_registry.as_deref(),
+                ) {
+                    Ok(identity) => identity,
+                    Err(e) => {
+                        return format!(
+                            "[Agent '{}' provider resolution failed: {}]",
+                            description, e
+                        )
+                    }
+                };
 
                 let health_cache = HealthCache::new();
                 let target = match resolve_provider_with_fallback(
@@ -668,6 +790,12 @@ pub fn init_team_swarm_runner() {
                         )
                     }
                 };
+                let provider_event = worker_provider_resolved_event(
+                    &description,
+                    &requested_identity.provider_id,
+                    &requested_identity.model_id,
+                    &target,
+                );
 
                 let system_prompt = system_prompt.unwrap_or_else(|| {
                     "You are a specialized AI agent helping with a specific sub-task. \
@@ -713,7 +841,16 @@ pub fn init_team_swarm_runner() {
                 )
                 .await;
 
-                format_outcome(outcome)
+                let mut observability_events = vec![provider_event];
+                if let Some(event) = worker_budget_exceeded_event(
+                    &description,
+                    session_budget.as_ref(),
+                    budget_usd,
+                ) {
+                    observability_events.push(event);
+                }
+
+                encode_team_runner_observability(format_outcome(outcome), observability_events)
             }) as Pin<Box<dyn std::future::Future<Output = String> + Send>>
         });
 

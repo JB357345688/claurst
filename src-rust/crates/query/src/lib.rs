@@ -50,6 +50,7 @@ use claurst_core::cost::CostTracker;
 use claurst_core::error::ClaudeError;
 use claurst_core::types::{ContentBlock, Message, ToolResultContent, UsageInfo};
 use claurst_tools::{Tool, ToolContext, ToolResult};
+use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -412,6 +413,21 @@ pub enum QueryEvent {
         result: String,
         is_error: bool,
     },
+    WorkerProviderResolved {
+        agent_id: String,
+        provider_id: String,
+        model_id: String,
+        was_fallback: bool,
+    },
+    WorkerBudgetExceeded {
+        agent_id: String,
+        cost_usd: f64,
+        limit_usd: f64,
+    },
+    SessionBudgetExceeded {
+        cost_usd: f64,
+        limit_usd: f64,
+    },
     /// The model finished a turn.
     TurnComplete {
         turn: u32,
@@ -429,6 +445,170 @@ pub enum QueryEvent {
         state: TokenWarningState,
         pct_used: f64,
     },
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolObservabilityMetadata {
+    #[serde(default)]
+    query_observability_events: Vec<ToolObservabilityEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ToolObservabilityEvent {
+    WorkerProviderResolved {
+        agent_id: String,
+        provider_id: String,
+        model_id: String,
+        was_fallback: bool,
+    },
+    WorkerBudgetExceeded {
+        agent_id: String,
+        cost_usd: f64,
+        limit_usd: f64,
+    },
+}
+
+fn parse_tool_observability_events(metadata: &Value) -> Vec<ToolObservabilityEvent> {
+    serde_json::from_value::<ToolObservabilityMetadata>(metadata.clone())
+        .map(|metadata| metadata.query_observability_events)
+        .unwrap_or_default()
+}
+
+fn split_team_runner_observability(output: &str) -> (String, Vec<ToolObservabilityEvent>) {
+    let prefix = crate::agent_tool::TEAM_RUNNER_OBSERVABILITY_PREFIX;
+    let suffix = crate::agent_tool::TEAM_RUNNER_OBSERVABILITY_SUFFIX;
+
+    let Some(start) = output.rfind(prefix) else {
+        return (output.to_string(), Vec::new());
+    };
+    if !output.ends_with(suffix) {
+        return (output.to_string(), Vec::new());
+    }
+
+    let payload_start = start + prefix.len();
+    let payload_end = output.len() - suffix.len();
+    let payload = &output[payload_start..payload_end];
+    let events = serde_json::from_str::<ToolObservabilityMetadata>(payload)
+        .map(|metadata| metadata.query_observability_events)
+        .unwrap_or_default();
+
+    (output[..start].to_string(), events)
+}
+
+fn extract_team_runner_observability(content: &str) -> (String, Vec<ToolObservabilityEvent>) {
+    let Ok(mut value) = serde_json::from_str::<Value>(content) else {
+        return (content.to_string(), Vec::new());
+    };
+    let Some(object) = value.as_object_mut() else {
+        return (content.to_string(), Vec::new());
+    };
+    let Some(results) = object.get_mut("results").and_then(Value::as_array_mut) else {
+        return (content.to_string(), Vec::new());
+    };
+
+    let mut events = Vec::new();
+    let mut rebuilt_aggregated = String::new();
+
+    for entry in results.iter_mut() {
+        let Some(entry_object) = entry.as_object_mut() else {
+            continue;
+        };
+        let agent_name = entry_object
+            .get("agent")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let Some(output_value) = entry_object.get_mut("output") else {
+            continue;
+        };
+        let Some(output) = output_value.as_str() else {
+            continue;
+        };
+
+        let (clean_output, mut output_events) = split_team_runner_observability(output);
+        *output_value = Value::String(clean_output.clone());
+        events.append(&mut output_events);
+
+        rebuilt_aggregated.push_str(&format!("## Agent: {}\n\n{}\n\n", agent_name, clean_output));
+    }
+
+    if object.contains_key("aggregated_output") {
+        object.insert(
+            "aggregated_output".to_string(),
+            Value::String(rebuilt_aggregated.trim().to_string()),
+        );
+    }
+
+    match serde_json::to_string(&value) {
+        Ok(serialized) => (serialized, events),
+        Err(_) => (content.to_string(), events),
+    }
+}
+
+fn emit_tool_observability_events(
+    tool_name: &str,
+    result: &mut ToolResult,
+    event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+) {
+    let mut events = result
+        .metadata
+        .as_ref()
+        .map(parse_tool_observability_events)
+        .unwrap_or_default();
+
+    if tool_name == "TeamCreate" {
+        let (sanitized_content, mut team_events) = extract_team_runner_observability(&result.content);
+        result.content = sanitized_content;
+        events.append(&mut team_events);
+    }
+
+    let Some(tx) = event_tx else {
+        return;
+    };
+
+    for event in events {
+        let query_event = match event {
+            ToolObservabilityEvent::WorkerProviderResolved {
+                agent_id,
+                provider_id,
+                model_id,
+                was_fallback,
+            } => QueryEvent::WorkerProviderResolved {
+                agent_id,
+                provider_id,
+                model_id,
+                was_fallback,
+            },
+            ToolObservabilityEvent::WorkerBudgetExceeded {
+                agent_id,
+                cost_usd,
+                limit_usd,
+            } => QueryEvent::WorkerBudgetExceeded {
+                agent_id,
+                cost_usd,
+                limit_usd,
+            },
+        };
+        let _ = tx.send(query_event);
+    }
+}
+
+fn emit_session_budget_exceeded(
+    event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+    shared_budget: &Arc<SessionBudget>,
+    was_cancelled: bool,
+) {
+    let Some(tx) = event_tx else {
+        return;
+    };
+
+    if !was_cancelled && shared_budget.is_cancelled() && shared_budget.is_limit_exceeded() {
+        let _ = tx.send(QueryEvent::SessionBudgetExceeded {
+            cost_usd: shared_budget.spent_usd(),
+            limit_usd: shared_budget.limit_usd(),
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,9 +1347,12 @@ async fn run_query_loop_inner(
                 usage.cache_read_input_tokens,
             );
             if let Some(ref session_budget) = config.session_budget {
+                let shared_budget = session_budget.shared_budget();
+                let was_shared_cancelled = shared_budget.is_cancelled();
                 let turn_cost = (cost_tracker.total_cost_usd() - spent_before_turn).max(0.0);
                 session_budget.record_cost(turn_cost);
                 session_budget.check_and_cancel();
+                emit_session_budget_exceeded(event_tx.as_ref(), &shared_budget, was_shared_cancelled);
             }
 
             messages.push(assistant_msg.clone());
@@ -1289,8 +1472,13 @@ async fn run_query_loop_inner(
                             input_json: tool_input.to_string(),
                         });
                     }
-                    let result =
+                    let mut result =
                         execute_tool(tool_name.as_str(), &tool_input, tools, tool_ctx).await;
+                    emit_tool_observability_events(
+                        tool_name.as_str(),
+                        &mut result,
+                        event_tx.as_ref(),
+                    );
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::ToolEnd {
                             tool_name: tool_name.clone(),
@@ -1437,9 +1625,12 @@ async fn run_query_loop_inner(
             usage.cache_read_input_tokens,
         );
         if let Some(ref session_budget) = config.session_budget {
+            let shared_budget = session_budget.shared_budget();
+            let was_shared_cancelled = shared_budget.is_cancelled();
             let turn_cost = (cost_tracker.total_cost_usd() - spent_before_turn).max(0.0);
             session_budget.record_cost(turn_cost);
             session_budget.check_and_cancel();
+            emit_session_budget_exceeded(event_tx.as_ref(), &shared_budget, was_shared_cancelled);
         }
 
         // Budget guard: abort the loop if the configured USD cap is exceeded.
@@ -1899,7 +2090,7 @@ async fn run_query_loop_inner(
 
                 // Phase 3: post-hooks, event emission, and result block assembly.
                 let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
-                for (p, result) in prepared.iter().zip(exec_results.into_iter()) {
+                for (p, mut result) in prepared.iter().zip(exec_results.into_iter()) {
                     let hooks = &tool_ctx.config.hooks;
                     let post_ctx = claurst_core::hooks::HookContext {
                         event: "PostToolUse".to_string(),
@@ -1923,6 +2114,8 @@ async fn run_query_loop_inner(
                         &result.content,
                         result.is_error,
                     );
+
+                    emit_tool_observability_events(&p.name, &mut result, event_tx.as_ref());
 
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::ToolEnd {
