@@ -145,6 +145,19 @@ fn inherited_child_cancel_token(
         .unwrap_or_else(CancellationToken::new)
 }
 
+fn child_session_budget(
+    inherited_budget: Option<Arc<crate::SessionBudget>>,
+    budget_usd: Option<f64>,
+) -> Option<Arc<crate::SessionBudget>> {
+    match (inherited_budget, budget_usd) {
+        (Some(parent_budget), Some(usd)) => {
+            Some(Arc::new(crate::SessionBudget::child_scope(parent_budget, usd)))
+        }
+        (None, Some(usd)) => Some(Arc::new(crate::SessionBudget::new(usd))),
+        (inherited_budget, None) => inherited_budget,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AgentInput {
     /// Short description of the agent's task (used for logging).
@@ -172,6 +185,9 @@ struct AgentInput {
     /// Optional: allow same-domain provider fallback for this sub-agent.
     #[serde(default)]
     allow_fallback: Option<bool>,
+    /// Optional: child-local cumulative USD cap for this sub-agent subtree.
+    #[serde(default)]
+    budget_usd: Option<f64>,
     /// Set to "worktree" to run the agent in an isolated git worktree.
     /// Omit (or set to null) for shared working directory.
     #[serde(default)]
@@ -240,6 +256,10 @@ impl Tool for AgentTool {
                 "allow_fallback": {
                     "type": "boolean",
                     "description": "Allow same-domain provider fallback for this child agent. Defaults to false when omitted."
+                },
+                "budget_usd": {
+                    "type": "number",
+                    "description": "Optional cumulative USD cap for this child subtree. When omitted, the child only inherits the parent shared session budget."
                 },
                 "isolation": {
                     "type": "string",
@@ -393,7 +413,10 @@ impl Tool for AgentTool {
                 (ctx.working_dir.display().to_string(), None, None)
             };
 
-        let session_budget = inherited_session_budget(&ctx.session_id);
+        let session_budget = child_session_budget(
+            inherited_session_budget(&ctx.session_id),
+            params.budget_usd,
+        );
 
         let query_config = QueryConfig {
             model: target.model_id.clone(),
@@ -592,6 +615,7 @@ pub fn init_team_swarm_runner() {
                     max_turns,
                     max_tokens_override,
                     allow_fallback,
+                    budget_usd,
                     ctx,
                     provider_override,
                     model_override,
@@ -651,7 +675,10 @@ pub fn init_team_swarm_runner() {
                         .to_string()
                 });
 
-                let session_budget = inherited_session_budget(&ctx.session_id);
+                let session_budget = child_session_budget(
+                    inherited_session_budget(&ctx.session_id),
+                    budget_usd,
+                );
 
                 let query_config = QueryConfig {
                     model: target.model_id.clone(),
