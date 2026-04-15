@@ -689,14 +689,39 @@ pub async fn run_query_loop(
     cost_tracker: Arc<CostTracker>,
     event_tx: Option<mpsc::UnboundedSender<QueryEvent>>,
     cancel_token: tokio_util::sync::CancellationToken,
+    pending_messages: Option<&mut Vec<String>>,
+) -> QueryOutcome {
+    with_registered_session_budget(
+        &tool_ctx.session_id,
+        config.session_budget.clone(),
+        run_query_loop_inner(
+            legacy_client,
+            messages,
+            tools,
+            tool_ctx,
+            config,
+            cost_tracker,
+            event_tx,
+            cancel_token,
+            pending_messages,
+        ),
+    )
+    .await
+}
+
+async fn run_query_loop_inner(
+    legacy_client: Option<&claurst_api::AnthropicClient>,
+    messages: &mut Vec<Message>,
+    tools: &[Box<dyn Tool>],
+    tool_ctx: &ToolContext,
+    config: &QueryConfig,
+    cost_tracker: Arc<CostTracker>,
+    event_tx: Option<mpsc::UnboundedSender<QueryEvent>>,
+    cancel_token: tokio_util::sync::CancellationToken,
     mut pending_messages: Option<&mut Vec<String>>,
 ) -> QueryOutcome {
     let mut turn = 0u32;
     let mut compact_state = compact::AutoCompactState::default();
-    let _session_budget_registration = config
-        .session_budget
-        .as_ref()
-        .map(|budget| register_session_budget(&tool_ctx.session_id, budget));
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
