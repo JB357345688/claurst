@@ -1,5 +1,12 @@
+use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+static SESSION_BUDGET_REGISTRY: Lazy<DashMap<String, (Arc<SessionBudget>, usize)>> =
+    Lazy::new(DashMap::new);
 
 #[derive(Debug)]
 pub struct SessionBudget {
@@ -36,9 +43,56 @@ impl SessionBudget {
     }
 }
 
+#[derive(Debug)]
+pub struct SessionBudgetRegistration {
+    session_id: String,
+}
+
+impl Drop for SessionBudgetRegistration {
+    fn drop(&mut self) {
+        if let Entry::Occupied(mut entry) = SESSION_BUDGET_REGISTRY.entry(self.session_id.clone()) {
+            let should_remove = {
+                let (_, registrations) = entry.get_mut();
+                *registrations -= 1;
+                *registrations == 0
+            };
+            if should_remove {
+                entry.remove();
+            }
+        }
+    }
+}
+
+pub fn register_session_budget(
+    session_id: &str,
+    budget: &Arc<SessionBudget>,
+) -> SessionBudgetRegistration {
+    match SESSION_BUDGET_REGISTRY.entry(session_id.to_string()) {
+        Entry::Occupied(mut entry) => {
+            let (registered_budget, registrations) = entry.get_mut();
+            *registered_budget = budget.clone();
+            *registrations += 1;
+        }
+        Entry::Vacant(entry) => {
+            entry.insert((budget.clone(), 1));
+        }
+    }
+
+    SessionBudgetRegistration {
+        session_id: session_id.to_string(),
+    }
+}
+
+pub fn session_budget_for_session(session_id: &str) -> Option<Arc<SessionBudget>> {
+    SESSION_BUDGET_REGISTRY
+        .get(session_id)
+        .map(|entry| entry.value().0.clone())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SessionBudget;
+    use super::{register_session_budget, session_budget_for_session, SessionBudget};
+    use std::sync::Arc;
 
     #[test]
     fn record_cost_accumulates_spend() {
@@ -76,5 +130,28 @@ mod tests {
 
         assert!(budget.is_cancelled());
         assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn registered_budget_is_visible_for_session() {
+        let budget = Arc::new(SessionBudget::new(3.0));
+        let _registration = register_session_budget("session-budget-visible", &budget);
+
+        let inherited =
+            session_budget_for_session("session-budget-visible").expect("budget must register");
+
+        assert!(Arc::ptr_eq(&budget, &inherited));
+    }
+
+    #[test]
+    fn registration_releases_when_last_guard_drops() {
+        let budget = Arc::new(SessionBudget::new(4.0));
+
+        {
+            let _registration = register_session_budget("session-budget-release", &budget);
+            assert!(session_budget_for_session("session-budget-release").is_some());
+        }
+
+        assert!(session_budget_for_session("session-budget-release").is_none());
     }
 }

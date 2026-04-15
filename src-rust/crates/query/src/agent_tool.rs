@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 use crate::provider_resolution::{
     materialize_provider, resolve_provider_identity, KNOWN_PROVIDERS,
 };
-use crate::{run_query_loop, QueryConfig, QueryOutcome};
+use crate::{run_query_loop, session_budget_for_session, QueryConfig, QueryOutcome};
 
 // ---------------------------------------------------------------------------
 // Background agent registry
@@ -130,6 +130,20 @@ pub struct AgentTool;
 // D1-safe interim fallback for spawned child agents; this is not the final
 // parent/child max_tokens policy.
 const CHILD_AGENT_FALLBACK_MAX_TOKENS: u32 = 4_096;
+
+fn inherited_session_budget(
+    session_id: &str,
+) -> Option<Arc<crate::SessionBudget>> {
+    session_budget_for_session(session_id)
+}
+
+fn inherited_child_cancel_token(
+    session_budget: Option<&Arc<crate::SessionBudget>>,
+) -> CancellationToken {
+    session_budget
+        .map(|budget| budget.child_cancel_token())
+        .unwrap_or_else(CancellationToken::new)
+}
 
 #[derive(Debug, Deserialize)]
 struct AgentInput {
@@ -359,6 +373,8 @@ impl Tool for AgentTool {
                 (ctx.working_dir.display().to_string(), None, None)
             };
 
+        let session_budget = inherited_session_budget(&ctx.session_id);
+
         let query_config = QueryConfig {
             model: target.model_id.clone(),
             max_tokens: CHILD_AGENT_FALLBACK_MAX_TOKENS,
@@ -374,7 +390,7 @@ impl Tool for AgentTool {
             effort_level: None,
             command_queue: None,
             skill_index: None,
-            session_budget: None,
+            session_budget: session_budget.clone(),
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: Some(registry.clone()),
@@ -406,7 +422,7 @@ impl Tool for AgentTool {
             let agent_id_bg = agent_id.clone();
 
             tokio::spawn(async move {
-                let cancel = CancellationToken::new();
+                let cancel = inherited_child_cancel_token(config_bg.session_budget.as_ref());
                 let mut messages = vec![Message::user(prompt_bg)];
                 let outcome = run_query_loop(
                     None,
@@ -452,7 +468,7 @@ impl Tool for AgentTool {
         // Synchronous mode: run the sub-agent loop and wait for completion.
         // -----------------------------------------------------------------------
         let mut messages = vec![Message::user(params.prompt)];
-        let cancel = CancellationToken::new();
+        let cancel = inherited_child_cancel_token(query_config.session_budget.as_ref());
 
         let outcome = run_query_loop(
             None,
@@ -618,6 +634,8 @@ pub fn init_team_swarm_runner() {
                         .to_string()
                 });
 
+                let session_budget = inherited_session_budget(&ctx.session_id);
+
                 let query_config = QueryConfig {
                     model: target.model_id.clone(),
                     max_tokens: CHILD_AGENT_FALLBACK_MAX_TOKENS,
@@ -626,7 +644,7 @@ pub fn init_team_swarm_runner() {
                     working_directory: Some(ctx.working_dir.display().to_string()),
                     output_style: ctx.config.effective_output_style(),
                     output_style_prompt: ctx.config.resolve_output_style_prompt(),
-                    session_budget: None,
+                    session_budget: session_budget.clone(),
                     provider_registry: Some(registry.clone()),
                     model_registry: ctx.model_registry.clone(),
                     ..Default::default()
@@ -635,7 +653,7 @@ pub fn init_team_swarm_runner() {
                 let mut runner_ctx = (*ctx).clone();
                 runner_ctx.config.provider = Some(target.provider_id.clone());
 
-                let cancel = tokio_util::sync::CancellationToken::new();
+                let cancel = inherited_child_cancel_token(query_config.session_budget.as_ref());
                 let mut messages = vec![Message::user(prompt)];
                 let outcome = run_query_loop(
                     None,

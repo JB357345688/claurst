@@ -693,6 +693,10 @@ pub async fn run_query_loop(
 ) -> QueryOutcome {
     let mut turn = 0u32;
     let mut compact_state = compact::AutoCompactState::default();
+    let _session_budget_registration = config
+        .session_budget
+        .as_ref()
+        .map(|budget| register_session_budget(&tool_ctx.session_id, budget));
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
