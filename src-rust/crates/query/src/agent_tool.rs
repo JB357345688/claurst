@@ -374,6 +374,7 @@ impl Tool for AgentTool {
             effort_level: None,
             command_queue: None,
             skill_index: None,
+            session_budget: None,
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: Some(registry.clone()),
@@ -625,6 +626,7 @@ pub fn init_team_swarm_runner() {
                     working_directory: Some(ctx.working_dir.display().to_string()),
                     output_style: ctx.config.effective_output_style(),
                     output_style_prompt: ctx.config.resolve_output_style_prompt(),
+                    session_budget: None,
                     provider_registry: Some(registry.clone()),
                     model_registry: ctx.model_registry.clone(),
                     ..Default::default()

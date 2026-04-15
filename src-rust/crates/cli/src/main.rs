@@ -101,6 +101,14 @@ impl Tool for McpToolWrapper {
     }
 }
 
+fn root_query_cancel_token(
+    session_budget: Option<&Arc<claurst_query::SessionBudget>>,
+) -> tokio_util::sync::CancellationToken {
+    session_budget
+        .map(|budget| budget.child_cancel_token())
+        .unwrap_or_else(tokio_util::sync::CancellationToken::new)
+}
+
 // ---------------------------------------------------------------------------
 // CLI argument definition (matches TypeScript main.tsx flags)
 // ---------------------------------------------------------------------------
@@ -243,6 +251,10 @@ struct Cli {
     /// Maximum spend in USD before aborting the query loop
     #[arg(long = "max-budget-usd", value_name = "USD")]
     max_budget_usd: Option<f64>,
+
+    /// Maximum cumulative spend in USD across the root session
+    #[arg(long = "budget-usd", value_name = "USD")]
+    budget_usd: Option<f64>,
 
     /// Fallback model to use if the primary model is overloaded or unavailable
     #[arg(long = "fallback-model")]
@@ -719,6 +731,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(usd) = cli.max_budget_usd {
         query_config.max_budget_usd = Some(usd);
     }
+    if let Some(usd) = cli.budget_usd {
+        query_config.session_budget = Some(Arc::new(claurst_query::SessionBudget::new(usd)));
+    }
     if let Some(ref fb) = cli.fallback_model {
         query_config.fallback_model = Some(fb.clone());
     }
@@ -1021,7 +1036,6 @@ async fn run_headless(
 ) -> anyhow::Result<()> {
     use claurst_query::{QueryEvent, QueryOutcome};
     use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
 
     // Build initial messages list from input.
     // --input-format stream-json: stdin is newline-delimited JSON, each line is
@@ -1113,7 +1127,7 @@ async fn run_headless(
     let is_stream_json = matches!(cli.output_format, CliOutputFormat::StreamJson);
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
-    let cancel = CancellationToken::new();
+    let cancel = root_query_cancel_token(query_config.session_budget.as_ref());
     let client_clone = client.clone();
     let tool_ctx_clone = tool_ctx.clone();
     let qcfg = query_config.clone();
@@ -2052,9 +2066,6 @@ async fn run_interactive(
                         app.is_streaming = true;
                         app.streaming_text.clear();
 
-                        let ct = CancellationToken::new();
-                        cancel = Some(ct.clone());
-
                         // Use Arc<Mutex> so the task can write updated messages back
                         let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
                         let msgs_arc_clone = msgs_arc.clone();
@@ -2077,6 +2088,8 @@ async fn run_interactive(
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
                         }
+                        let ct = root_query_cancel_token(qcfg.session_budget.as_ref());
+                        cancel = Some(ct.clone());
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
@@ -2272,8 +2285,6 @@ async fn run_interactive(
                 session.updated_at = chrono::Utc::now();
 
                 // Dispatch the compact query immediately.
-                let ct = CancellationToken::new();
-                cancel = Some(ct.clone());
                 let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
                 let msgs_arc_clone = msgs_arc.clone();
                 let tools_arc_clone = tools_arc.clone();
@@ -2282,6 +2293,8 @@ async fn run_interactive(
                 qcfg.model =
                     claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                let ct = root_query_cancel_token(qcfg.session_budget.as_ref());
+                cancel = Some(ct.clone());
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();
@@ -2425,8 +2438,6 @@ async fn run_interactive(
                         session.updated_at = chrono::Utc::now();
                         app.is_streaming = true;
                         app.streaming_text.clear();
-                        let ct = CancellationToken::new();
-                        cancel = Some(ct.clone());
                         let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
                         let msgs_arc_clone = msgs_arc.clone();
                         let tools_arc_clone = tools_arc.clone();
@@ -2437,6 +2448,8 @@ async fn run_interactive(
                             &model_registry,
                         );
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                        let ct = root_query_cancel_token(qcfg.session_budget.as_ref());
+                        cancel = Some(ct.clone());
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
@@ -2539,8 +2552,6 @@ async fn run_interactive(
                 session.updated_at = chrono::Utc::now();
                 app.is_streaming = true;
                 app.streaming_text.clear();
-                let ct = CancellationToken::new();
-                cancel = Some(ct.clone());
                 let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
                 let msgs_arc_clone = msgs_arc.clone();
                 let tools_arc_clone = tools_arc.clone();
@@ -2549,6 +2560,8 @@ async fn run_interactive(
                 qcfg.model =
                     claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                let ct = root_query_cancel_token(qcfg.session_budget.as_ref());
+                cancel = Some(ct.clone());
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();

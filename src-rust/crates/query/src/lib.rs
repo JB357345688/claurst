@@ -112,6 +112,9 @@ pub struct QueryConfig {
     /// the resulting index is used to inject a skill listing attachment into
     /// the conversation context.
     pub skill_index: Option<SharedSkillIndex>,
+    /// Optional cross-session USD budget shared across root query-loop runs.
+    /// Distinct from `max_budget_usd`, which remains a per-loop limit.
+    pub session_budget: Option<Arc<SessionBudget>>,
     /// Optional USD spend cap. The query loop checks accumulated cost after
     /// each turn and aborts with `QueryOutcome::BudgetExceeded` when exceeded.
     pub max_budget_usd: Option<f64>,
@@ -149,6 +152,7 @@ impl Default for QueryConfig {
             effort_level: None,
             command_queue: None,
             skill_index: None,
+            session_budget: None,
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: None,
@@ -1126,12 +1130,18 @@ pub async fn run_query_loop(
                 cost: None,
             };
 
+            let spent_before_turn = cost_tracker.total_cost_usd();
             cost_tracker.add_usage(
                 usage.input_tokens,
                 usage.output_tokens,
                 usage.cache_creation_input_tokens,
                 usage.cache_read_input_tokens,
             );
+            if let Some(ref session_budget) = config.session_budget {
+                let turn_cost = (cost_tracker.total_cost_usd() - spent_before_turn).max(0.0);
+                session_budget.record_cost(turn_cost);
+                session_budget.check_and_cancel();
+            }
 
             messages.push(assistant_msg.clone());
 
@@ -1390,12 +1400,18 @@ pub async fn run_query_loop(
         let (assistant_msg, usage, stop_reason) = accumulator.finish();
 
         // Track costs
+        let spent_before_turn = cost_tracker.total_cost_usd();
         cost_tracker.add_usage(
             usage.input_tokens,
             usage.output_tokens,
             usage.cache_creation_input_tokens,
             usage.cache_read_input_tokens,
         );
+        if let Some(ref session_budget) = config.session_budget {
+            let turn_cost = (cost_tracker.total_cost_usd() - spent_before_turn).max(0.0);
+            session_budget.record_cost(turn_cost);
+            session_budget.check_and_cancel();
+        }
 
         // Budget guard: abort the loop if the configured USD cap is exceeded.
         if let Some(limit) = config.max_budget_usd {
@@ -2143,6 +2159,7 @@ mod tests {
             effort_level: None,
             command_queue: None,
             skill_index: None,
+            session_budget: None,
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: None,
