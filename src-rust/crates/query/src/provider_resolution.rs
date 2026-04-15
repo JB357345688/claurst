@@ -283,7 +283,11 @@ fn select_fallback_model(
             .into_iter()
             .filter(|entry| entry.family.as_deref() == Some(family))
             .filter(|entry| {
-                supports_required_capabilities(Some(entry), provider_caps, DEFAULT_REQUIRED_CAPABILITIES)
+                supports_required_capabilities(
+                    Some(entry),
+                    provider_caps,
+                    DEFAULT_REQUIRED_CAPABILITIES,
+                )
             })
             .collect::<Vec<_>>();
         family_matches.sort_by(|a, b| (&*b.info.id).cmp(&*a.info.id));
@@ -375,11 +379,9 @@ pub async fn resolve_provider_with_fallback(
             resolution_source: ResolutionSource::ModelRegistry,
         };
 
-        if let Ok(target) = materialize_provider(
-            &fallback_identity,
-            provider_registry,
-            provider_configs,
-        ) {
+        if let Ok(target) =
+            materialize_provider(&fallback_identity, provider_registry, provider_configs)
+        {
             return Ok(target);
         }
     }
@@ -429,8 +431,8 @@ mod tests {
     use super::{
         materialize_provider, model_supports_capability, normalize_ollama_api_base,
         provider_supports_capability, resolve_provider_identity, resolve_provider_with_fallback,
-        Capability, DEFAULT_REQUIRED_CAPABILITIES, ProviderIdentity, ProviderResolutionError,
-        ResolutionSource,
+        Capability, ProviderIdentity, ProviderResolutionError, ResolutionSource,
+        DEFAULT_REQUIRED_CAPABILITIES,
     };
     use std::{
         collections::HashMap,
@@ -439,6 +441,7 @@ mod tests {
         sync::Arc,
     };
 
+    use crate::HealthCache;
     use async_trait::async_trait;
     use claurst_api::{
         LlmProvider, ModelEntry, ModelInfo, ModelRegistry, OpenAiProvider, ProviderCapabilities,
@@ -446,7 +449,6 @@ mod tests {
     };
     use claurst_core::{config::ProviderConfig, AuthStore, ModelId, ProviderId, StoredCredential};
     use tempfile::TempDir;
-    use crate::HealthCache;
 
     struct TestProvider {
         id: ProviderId,
@@ -918,7 +920,10 @@ mod tests {
             system_prompt_style: SystemPromptStyle::SystemMessage,
         };
 
-        assert!(provider_supports_capability(&caps, &Capability::ToolCalling));
+        assert!(provider_supports_capability(
+            &caps,
+            &Capability::ToolCalling
+        ));
         assert!(!provider_supports_capability(&caps, &Capability::Reasoning));
         assert!(provider_supports_capability(&caps, &Capability::Vision));
         assert!(!provider_supports_capability(&caps, &Capability::PdfInput));

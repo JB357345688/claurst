@@ -79,8 +79,8 @@ mod tests {
     use claurst_core::ProviderId;
     use futures::stream;
     use std::pin::Pin;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     struct TestProvider {
@@ -137,8 +137,10 @@ mod tests {
         async fn create_message_stream(
             &self,
             _request: ProviderRequest,
-        ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
-        {
+        ) -> Result<
+            Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
+            ProviderError,
+        > {
             Ok(Box::pin(stream::empty()))
         }
 
@@ -210,7 +212,10 @@ mod tests {
         let cache = HealthCache::with_ttl(Duration::from_millis(10));
         cache.cache.insert(
             "provider-a".to_string(),
-            (ProviderStatus::Healthy, Instant::now() - Duration::from_secs(1)),
+            (
+                ProviderStatus::Healthy,
+                Instant::now() - Duration::from_secs(1),
+            ),
         );
 
         assert!(cache.get("provider-a").is_none());
