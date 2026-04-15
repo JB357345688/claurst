@@ -28,10 +28,10 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::provider_resolution::{
-    materialize_provider, resolve_provider_identity, KNOWN_PROVIDERS,
+use crate::provider_resolution::{resolve_provider_with_fallback, KNOWN_PROVIDERS};
+use crate::{
+    run_query_loop, session_budget_for_session, HealthCache, QueryConfig, QueryOutcome,
 };
-use crate::{run_query_loop, session_budget_for_session, QueryConfig, QueryOutcome};
 
 // ---------------------------------------------------------------------------
 // Background agent registry
@@ -169,6 +169,9 @@ struct AgentInput {
     /// Optional: explicit provider override (e.g., "openai", "google").
     #[serde(default)]
     provider: Option<String>,
+    /// Optional: allow same-domain provider fallback for this sub-agent.
+    #[serde(default)]
+    allow_fallback: Option<bool>,
     /// Set to "worktree" to run the agent in an isolated git worktree.
     /// Omit (or set to null) for shared working directory.
     #[serde(default)]
@@ -233,6 +236,10 @@ impl Tool for AgentTool {
                 "provider": {
                     "type": "string",
                     "description": "Explicit provider to use for this agent (e.g., 'openai', 'google'). When omitted, inherits from parent session."
+                },
+                "allow_fallback": {
+                    "type": "boolean",
+                    "description": "Allow same-domain provider fallback for this child agent. Defaults to false when omitted."
                 },
                 "isolation": {
                     "type": "string",
@@ -302,15 +309,21 @@ impl Tool for AgentTool {
             }
         };
 
-        let identity =
-            match resolve_provider_identity(provider_hint, &model, ctx.model_registry.as_deref()) {
-                Ok(identity) => identity,
-                Err(e) => return ToolResult::error(format!("Provider resolution failed: {}", e)),
-            };
-
-        let target = match materialize_provider(&identity, registry, &ctx.config.provider_configs) {
+        let allow_fallback = params.allow_fallback.unwrap_or(false);
+        let health_cache = HealthCache::new();
+        let target = match resolve_provider_with_fallback(
+            provider_hint,
+            &model,
+            ctx.model_registry.as_deref(),
+            registry,
+            &ctx.config.provider_configs,
+            &health_cache,
+            allow_fallback,
+        )
+        .await
+        {
             Ok(target) => target,
-            Err(e) => return ToolResult::error(format!("Provider materialization failed: {}", e)),
+            Err(e) => return ToolResult::error(format!("Provider resolution failed: {}", e)),
         };
 
         let system_prompt = params.system_prompt.unwrap_or_else(|| {
@@ -578,6 +591,7 @@ pub fn init_team_swarm_runner() {
                     system_prompt,
                     max_turns,
                     max_tokens_override,
+                    allow_fallback,
                     ctx,
                     provider_override,
                     model_override,
@@ -610,29 +624,22 @@ pub fn init_team_swarm_runner() {
                     .filter(|m| !m.is_empty())
                     .unwrap_or_else(|| claurst_core::constants::DEFAULT_MODEL.to_string());
 
-                let identity = match resolve_provider_identity(
+                let health_cache = HealthCache::new();
+                let target = match resolve_provider_with_fallback(
                     provider_override.as_deref().filter(|p| !p.is_empty()),
                     &model,
                     ctx.model_registry.as_deref(),
-                ) {
-                    Ok(identity) => identity,
-                    Err(e) => {
-                        return format!(
-                            "[Agent '{}' provider resolution failed: {}]",
-                            description, e
-                        )
-                    }
-                };
-
-                let target = match materialize_provider(
-                    &identity,
                     &registry,
                     &ctx.config.provider_configs,
-                ) {
+                    &health_cache,
+                    allow_fallback,
+                )
+                .await
+                {
                     Ok(target) => target,
                     Err(e) => {
                         return format!(
-                            "[Agent '{}' provider materialization failed: {}]",
+                            "[Agent '{}' provider resolution failed: {}]",
                             description, e
                         )
                     }

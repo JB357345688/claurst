@@ -41,6 +41,7 @@ pub struct AgentRunParams {
     pub system_prompt: Option<String>,
     pub max_turns: Option<u32>,
     pub max_tokens_override: Option<u32>,
+    pub allow_fallback: bool,
     pub ctx: Arc<ToolContext>,
     pub provider_override: Option<String>,
     pub model_override: Option<String>,
@@ -173,6 +174,9 @@ struct AgentSpec {
     /// Optional max tokens override for this agent's child query loop.
     #[serde(default)]
     max_tokens: Option<u32>,
+    /// Optional same-domain provider fallback setting for this agent.
+    #[serde(default)]
+    allow_fallback: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -254,6 +258,10 @@ impl Tool for TeamCreateTool {
                             "max_tokens": {
                                 "type": "integer",
                                 "description": "Optional max tokens override for this agent. Defaults to 4096 when omitted."
+                            },
+                            "allow_fallback": {
+                                "type": "boolean",
+                                "description": "Allow same-domain provider fallback for this agent. Defaults to false when omitted."
                             }
                         },
                         "required": ["name"]
@@ -397,6 +405,7 @@ impl Tool for TeamCreateTool {
                 let provider_override = spec.provider.clone();
                 let model_override = spec.model.clone();
                 let max_tokens_override = spec.max_tokens;
+                let allow_fallback = spec.allow_fallback.unwrap_or(false);
                 let team_name_inner = final_name.clone();
                 let cancel = cancel_tokens[i].clone();
                 let ctx_inner = ctx_arc.clone();
@@ -426,6 +435,7 @@ impl Tool for TeamCreateTool {
                             system_prompt: Some(system_prompt),
                             max_turns: Some(10),
                             max_tokens_override,
+                            allow_fallback,
                             ctx: ctx_inner,
                             provider_override,
                             model_override,
