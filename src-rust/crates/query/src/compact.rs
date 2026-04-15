@@ -141,20 +141,17 @@ fn extract_topic_hint(messages: &[Message]) -> Option<String> {
             _ => continue,
         };
         for block in blocks {
-            match block {
-                ContentBlock::ToolUse { name, input, .. } => {
-                    // Try to get a file_path from input, else use tool name
-                    if let Some(fp) = input.get("file_path").and_then(|v| v.as_str()) {
-                        return Some(fp.to_string());
-                    }
-                    if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-                        // Use first word of command as hint
-                        let first_word = cmd.split_whitespace().next().unwrap_or(cmd);
-                        return Some(first_word.to_string());
-                    }
-                    return Some(name.clone());
+            if let ContentBlock::ToolUse { name, input, .. } = block {
+                // Try to get a file_path from input, else use tool name
+                if let Some(fp) = input.get("file_path").and_then(|v| v.as_str()) {
+                    return Some(fp.to_string());
                 }
-                _ => {}
+                if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                    // Use first word of command as hint
+                    let first_word = cmd.split_whitespace().next().unwrap_or(cmd);
+                    return Some(first_word.to_string());
+                }
+                return Some(name.clone());
             }
         }
     }
@@ -167,7 +164,7 @@ fn estimate_tokens_for_messages(messages: &[Message]) -> usize {
         .iter()
         .map(|m| match &m.content {
             MessageContent::Text(t) => t.len(),
-            MessageContent::Blocks(blocks) => blocks.iter().map(|b| estimate_block_chars(b)).sum(),
+            MessageContent::Blocks(blocks) => blocks.iter().map(estimate_block_chars).sum(),
         })
         .sum();
     // chars / 4 = rough tokens, then * 4/3 padding
@@ -181,7 +178,7 @@ fn estimate_block_chars(block: &ContentBlock) -> usize {
         ContentBlock::ToolResult { content, .. } => match content {
             claurst_core::types::ToolResultContent::Text(t) => t.len(),
             claurst_core::types::ToolResultContent::Blocks(blocks) => {
-                blocks.iter().map(|b| estimate_block_chars(b)).sum()
+                blocks.iter().map(estimate_block_chars).sum()
             }
         },
         ContentBlock::Thinking { thinking, .. } => thinking.len(),
@@ -490,9 +487,12 @@ pub fn format_compact_summary(raw: &str) -> String {
 /// Return the effective context-window size in tokens for the given model.
 /// These are approximate; the API enforces the real limits server-side.
 pub fn context_window_for_model(model: &str) -> u64 {
-    if model.contains("opus-4") || model.contains("sonnet-4") || model.contains("haiku-4") {
-        200_000
-    } else if model.contains("claude-3-5") || model.contains("claude-3.5") {
+    if model.contains("opus-4")
+        || model.contains("sonnet-4")
+        || model.contains("haiku-4")
+        || model.contains("claude-3-5")
+        || model.contains("claude-3.5")
+    {
         200_000
     } else {
         100_000
@@ -1608,7 +1608,7 @@ pub fn collapse_search_results(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claurst_core::types::{Message, Role};
+    use claurst_core::types::Message;
 
     fn make_user(text: &str) -> Message {
         Message::user(text)
@@ -1660,8 +1660,10 @@ mod tests {
 
     #[test]
     fn test_should_not_compact_when_disabled() {
-        let mut state = AutoCompactState::default();
-        state.disabled = true;
+        let state = AutoCompactState {
+            disabled: true,
+            ..AutoCompactState::default()
+        };
         assert!(!should_auto_compact(195_000, "claude-sonnet-4-6", &state));
     }
 
