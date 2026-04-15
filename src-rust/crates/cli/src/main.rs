@@ -719,7 +719,7 @@ async fn main() -> anyhow::Result<()> {
         query_config.thinking_budget = Some(tokens);
     }
     if let Some(ref level_str) = cli.effort {
-        if let Some(level) = claurst_core::effort::EffortLevel::from_str(level_str) {
+        if let Some(level) = level_str.parse::<claurst_core::effort::EffortLevel>().ok() {
             query_config.effort_level = Some(level);
         } else {
             eprintln!(
@@ -1955,7 +1955,7 @@ async fn run_interactive(
                             // /effort with explicit args (/effort high).
                             if handled_by_cli && cmd_name == "effort" && !cmd_args.is_empty() {
                                 if let Some(level) =
-                                    claurst_core::effort::EffortLevel::from_str(&cmd_args)
+                                    cmd_args.parse::<claurst_core::effort::EffortLevel>().ok()
                                 {
                                     current_effort = Some(level);
                                     app.effort_level = match level {

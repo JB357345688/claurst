@@ -28,23 +28,9 @@ pub enum EffortLevel {
 }
 
 impl EffortLevel {
-    /// Parse an effort level from its string representation.
-    ///
-    /// Accepts lowercase strings: `"low"`, `"medium"`, `"high"`, `"max"`.
-    /// Returns `None` for any other value.
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "low" => Some(Self::Low),
-            "medium" => Some(Self::Medium),
-            "high" => Some(Self::High),
-            "max" => Some(Self::Max),
-            _ => None,
-        }
-    }
-
     /// The lowercase string name of this effort level.
     ///
-    /// Round-trips with `from_str`.
+    /// Round-trips with `std::str::FromStr`.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Low => "low",
@@ -113,6 +99,20 @@ impl EffortLevel {
     }
 }
 
+impl std::str::FromStr for EffortLevel {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "max" => Ok(Self::Max),
+            _ => Err(()),
+        }
+    }
+}
+
 impl std::fmt::Display for EffortLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -135,10 +135,10 @@ mod tests {
             EffortLevel::High,
             EffortLevel::Max,
         ] {
-            let parsed = EffortLevel::from_str(level.as_str());
+            let parsed = level.as_str().parse::<EffortLevel>();
             assert_eq!(
                 parsed,
-                Some(level),
+                Ok(level),
                 "from_str({:?}) should round-trip",
                 level
             );
@@ -147,17 +147,17 @@ mod tests {
 
     #[test]
     fn from_str_case_insensitive() {
-        assert_eq!(EffortLevel::from_str("LOW"), Some(EffortLevel::Low));
-        assert_eq!(EffortLevel::from_str("Medium"), Some(EffortLevel::Medium));
-        assert_eq!(EffortLevel::from_str("HIGH"), Some(EffortLevel::High));
-        assert_eq!(EffortLevel::from_str("Max"), Some(EffortLevel::Max));
+        assert_eq!("LOW".parse::<EffortLevel>(), Ok(EffortLevel::Low));
+        assert_eq!("Medium".parse::<EffortLevel>(), Ok(EffortLevel::Medium));
+        assert_eq!("HIGH".parse::<EffortLevel>(), Ok(EffortLevel::High));
+        assert_eq!("Max".parse::<EffortLevel>(), Ok(EffortLevel::Max));
     }
 
     #[test]
     fn from_str_unknown_returns_none() {
-        assert_eq!(EffortLevel::from_str("ultra"), None);
-        assert_eq!(EffortLevel::from_str(""), None);
-        assert_eq!(EffortLevel::from_str("3"), None);
+        assert_eq!("ultra".parse::<EffortLevel>(), Err(()));
+        assert_eq!("".parse::<EffortLevel>(), Err(()));
+        assert_eq!("3".parse::<EffortLevel>(), Err(()));
     }
 
     #[test]
