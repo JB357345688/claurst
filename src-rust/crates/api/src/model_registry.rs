@@ -329,8 +329,8 @@ impl ModelRegistry {
         // the canonical ID (e.g. "gemini-3-flash-preview" may be stored as
         // "gemini-3-flash-preview-05-20").  Try a prefix match.
         for entry in self.entries.values() {
-            if (&*entry.info.id).starts_with(model_name) || model_name.starts_with(&*entry.info.id)
-            {
+            let entry_model = &entry.info.id[..];
+            if entry_model.starts_with(model_name) || model_name.starts_with(entry_model) {
                 return Some(entry.info.provider_id.clone());
             }
         }
