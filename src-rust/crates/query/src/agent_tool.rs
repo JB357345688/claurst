@@ -160,6 +160,9 @@ struct AgentInput {
     /// Optional: max turns for the sub-agent (default 10).
     #[serde(default)]
     max_turns: Option<u32>,
+    /// Optional: max tokens override for the child query loop.
+    #[serde(default)]
+    max_tokens: Option<u32>,
     /// Optional: model override for this sub-agent.
     #[serde(default)]
     model: Option<String>,
@@ -218,6 +221,10 @@ impl Tool for AgentTool {
                 "max_turns": {
                     "type": "number",
                     "description": "Maximum number of turns for the sub-agent (default 10)"
+                },
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Optional max tokens override for the child agent. Defaults to 4096 when omitted."
                 },
                 "model": {
                     "type": "string",
@@ -377,7 +384,9 @@ impl Tool for AgentTool {
 
         let query_config = QueryConfig {
             model: target.model_id.clone(),
-            max_tokens: CHILD_AGENT_FALLBACK_MAX_TOKENS,
+            max_tokens: params
+                .max_tokens
+                .unwrap_or(CHILD_AGENT_FALLBACK_MAX_TOKENS),
             max_turns: params.max_turns.unwrap_or(10),
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
@@ -568,6 +577,7 @@ pub fn init_team_swarm_runner() {
                     tools,
                     system_prompt,
                     max_turns,
+                    max_tokens_override,
                     ctx,
                     provider_override,
                     model_override,
@@ -638,7 +648,8 @@ pub fn init_team_swarm_runner() {
 
                 let query_config = QueryConfig {
                     model: target.model_id.clone(),
-                    max_tokens: CHILD_AGENT_FALLBACK_MAX_TOKENS,
+                    max_tokens: max_tokens_override
+                        .unwrap_or(CHILD_AGENT_FALLBACK_MAX_TOKENS),
                     max_turns: max_turns.unwrap_or(10),
                     system_prompt: Some(system_prompt),
                     working_directory: Some(ctx.working_dir.display().to_string()),
