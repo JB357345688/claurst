@@ -5,6 +5,7 @@
 //! volatile, session-specific sections follow it.
 
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -109,16 +110,20 @@ impl OutputStyle {
         }
     }
 
-    /// Parse from a string (case-insensitive).
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+}
+
+impl std::str::FromStr for OutputStyle {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
             "explanatory" => Self::Explanatory,
             "learning" => Self::Learning,
             "concise" => Self::Concise,
             "formal" => Self::Formal,
             "casual" => Self::Casual,
             _ => Self::Default,
-        }
+        })
     }
 }
 
@@ -246,29 +251,18 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         SystemPromptPrefix::detect(opts.is_non_interactive, opts.has_append_system_prompt)
     });
 
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts: Vec<String> = vec![
+        prefix.attribution_text().to_string(),
+        CORE_CAPABILITIES.to_string(),
+        TOOL_USE_GUIDELINES.to_string(),
+        ACTIONS_SECTION.to_string(),
+        SAFETY_GUIDELINES.to_string(),
+        CYBER_RISK_INSTRUCTION.to_string(),
+    ];
 
     // ------------------------------------------------------------------ //
     // CACHEABLE sections (before the dynamic boundary)                   //
     // ------------------------------------------------------------------ //
-
-    // 1. Attribution header
-    parts.push(prefix.attribution_text().to_string());
-
-    // 2. Core capabilities
-    parts.push(CORE_CAPABILITIES.to_string());
-
-    // 3. Tool use guidelines
-    parts.push(TOOL_USE_GUIDELINES.to_string());
-
-    // 4. Executing actions with care
-    parts.push(ACTIONS_SECTION.to_string());
-
-    // 5. Safety guidelines
-    parts.push(SAFETY_GUIDELINES.to_string());
-
-    // 6. Cyber-risk instruction (owned by safeguards — do not edit)
-    parts.push(CYBER_RISK_INSTRUCTION.to_string());
 
     // 7. Output style (cacheable when non-Default; its content is stable)
     if let Some(style_text) = opts
@@ -624,9 +618,9 @@ mod tests {
 
     #[test]
     fn test_output_style_from_str() {
-        assert_eq!(OutputStyle::from_str("concise"), OutputStyle::Concise);
-        assert_eq!(OutputStyle::from_str("FORMAL"), OutputStyle::Formal);
-        assert_eq!(OutputStyle::from_str("unknown"), OutputStyle::Default);
+        assert_eq!("concise".parse::<OutputStyle>().unwrap(), OutputStyle::Concise);
+        assert_eq!("FORMAL".parse::<OutputStyle>().unwrap(), OutputStyle::Formal);
+        assert_eq!("unknown".parse::<OutputStyle>().unwrap(), OutputStyle::Default);
     }
 
     #[test]
