@@ -861,6 +861,9 @@ const MAX_TOKENS_RECOVERY_MSG: &str =
 /// during tool execution (e.g. by the UI or a command queue).  Each string is
 /// appended as a plain user message between turns.  Callers that do not need
 /// command queuing may pass `None` or an empty `Vec`.
+// This is the established query-loop seam used by multiple repo-local
+// entrypoints, so the signature stays stable in this lib.rs-only lint tranche.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_query_loop(
     legacy_client: Option<&claurst_api::AnthropicClient>,
     messages: &mut Vec<Message>,
@@ -890,6 +893,9 @@ pub async fn run_query_loop(
     .await
 }
 
+// This inner seam mirrors the public query-loop entrypoint above, so the
+// signature refactor is intentionally deferred instead of widening this ticket.
+#[allow(clippy::too_many_arguments)]
 async fn run_query_loop_inner(
     legacy_client: Option<&claurst_api::AnthropicClient>,
     messages: &mut Vec<Message>,
@@ -2203,7 +2209,7 @@ fn build_todo_nudge(session_id: &str) -> String {
     let todos = claurst_tools::todo_write::load_todos(session_id);
     let incomplete_count = todos
         .iter()
-        .filter(|t| t["status"].as_str().map_or(true, |s| s != "completed"))
+        .filter(|t| t["status"].as_str() != Some("completed"))
         .count();
     if incomplete_count == 0 {
         String::new()
@@ -2358,6 +2364,51 @@ pub(crate) fn provider_auth_test_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// Stream handler that forwards events to an unbounded channel.
+struct ChannelStreamHandler {
+    tx: mpsc::UnboundedSender<QueryEvent>,
+}
+
+impl StreamHandler for ChannelStreamHandler {
+    fn on_event(&self, event: &AnthropicStreamEvent) {
+        let _ = self.tx.send(QueryEvent::Stream(event.clone()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Single-shot query (non-looping, for simple one-off calls)
+// ---------------------------------------------------------------------------
+
+/// Run a single (non-agentic) query - no tool loop, just one API call.
+pub async fn run_single_query(
+    client: &claurst_api::AnthropicClient,
+    messages: Vec<Message>,
+    config: &QueryConfig,
+) -> Result<Message, ClaudeError> {
+    let api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
+    let system = build_system_prompt(config);
+
+    let request = CreateMessageRequest::builder(&config.model, config.max_tokens)
+        .messages(api_messages)
+        .system(system)
+        .build();
+
+    let handler: Arc<dyn StreamHandler> = Arc::new(claurst_api::streaming::NullStreamHandler);
+
+    let mut rx = client.create_message_stream(request, handler).await?;
+    let mut acc = StreamAccumulator::new();
+
+    while let Some(evt) = rx.recv().await {
+        acc.on_event(&evt);
+        if matches!(evt, AnthropicStreamEvent::MessageStop) {
+            break;
+        }
+    }
+
+    let (msg, _usage, _stop) = acc.finish();
+    Ok(msg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2440,8 +2491,10 @@ mod tests {
     }
 
     fn make_tool_context(parent_provider: Option<&str>) -> ToolContext {
-        let mut config = claurst_core::config::Config::default();
-        config.provider = parent_provider.map(str::to_string);
+        let config = claurst_core::config::Config {
+            provider: parent_provider.map(str::to_string),
+            ..Default::default()
+        };
 
         ToolContext {
             working_dir: std::env::temp_dir(),
@@ -2828,49 +2881,4 @@ mod tests {
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
     }
-}
-
-/// Stream handler that forwards events to an unbounded channel.
-struct ChannelStreamHandler {
-    tx: mpsc::UnboundedSender<QueryEvent>,
-}
-
-impl StreamHandler for ChannelStreamHandler {
-    fn on_event(&self, event: &AnthropicStreamEvent) {
-        let _ = self.tx.send(QueryEvent::Stream(event.clone()));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Single-shot query (non-looping, for simple one-off calls)
-// ---------------------------------------------------------------------------
-
-/// Run a single (non-agentic) query – no tool loop, just one API call.
-pub async fn run_single_query(
-    client: &claurst_api::AnthropicClient,
-    messages: Vec<Message>,
-    config: &QueryConfig,
-) -> Result<Message, ClaudeError> {
-    let api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
-    let system = build_system_prompt(config);
-
-    let request = CreateMessageRequest::builder(&config.model, config.max_tokens)
-        .messages(api_messages)
-        .system(system)
-        .build();
-
-    let handler: Arc<dyn StreamHandler> = Arc::new(claurst_api::streaming::NullStreamHandler);
-
-    let mut rx = client.create_message_stream(request, handler).await?;
-    let mut acc = StreamAccumulator::new();
-
-    while let Some(evt) = rx.recv().await {
-        acc.on_event(&evt);
-        if matches!(evt, AnthropicStreamEvent::MessageStop) {
-            break;
-        }
-    }
-
-    let (msg, _usage, _stop) = acc.finish();
-    Ok(msg)
 }
