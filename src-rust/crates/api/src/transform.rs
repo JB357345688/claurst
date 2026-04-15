@@ -32,7 +32,7 @@ pub trait MessageTransformer: Send + Sync {
 
     /// Deserialize a provider-specific JSON response body into a
     /// `ProviderResponse`.
-    fn from_provider(
+    fn parse_provider_response(
         &self,
         response: &serde_json::Value,
     ) -> Result<ProviderResponse, ProviderError>;

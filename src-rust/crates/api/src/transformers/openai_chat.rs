@@ -60,7 +60,7 @@ impl MessageTransformer for OpenAiChatTransformer {
         Ok(body)
     }
 
-    fn from_provider(
+    fn parse_provider_response(
         &self,
         response: &serde_json::Value,
     ) -> Result<ProviderResponse, ProviderError> {

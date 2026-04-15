@@ -3,7 +3,8 @@
 //
 // The Anthropic provider is the native/internal format for Claurst, so
 // `to_provider` serialises the request fields directly to the Anthropic v1
-// messages schema and `from_provider` parses the standard Anthropic response.
+// messages schema and `parse_provider_response` parses the standard
+// Anthropic response.
 
 use crate::provider::ModelInfo;
 use crate::provider_error::ProviderError;
@@ -106,7 +107,7 @@ impl MessageTransformer for AnthropicTransformer {
         Ok(body)
     }
 
-    fn from_provider(
+    fn parse_provider_response(
         &self,
         response: &serde_json::Value,
     ) -> Result<ProviderResponse, ProviderError> {
