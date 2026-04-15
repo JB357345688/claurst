@@ -31,9 +31,7 @@ use tracing::{debug, info, warn};
 use crate::provider_resolution::{
     resolve_provider_identity, resolve_provider_with_fallback, ExecutionTarget, KNOWN_PROVIDERS,
 };
-use crate::{
-    run_query_loop, session_budget_for_session, HealthCache, QueryConfig, QueryOutcome,
-};
+use crate::{run_query_loop, session_budget_for_session, HealthCache, QueryConfig, QueryOutcome};
 
 // ---------------------------------------------------------------------------
 // Background agent registry
@@ -136,9 +134,7 @@ pub(crate) const TOOL_OBSERVABILITY_EVENTS_KEY: &str = "query_observability_even
 pub(crate) const TEAM_RUNNER_OBSERVABILITY_PREFIX: &str = "\n\n[[CLAURST_QUERY_OBS:";
 pub(crate) const TEAM_RUNNER_OBSERVABILITY_SUFFIX: &str = "]]";
 
-fn inherited_session_budget(
-    session_id: &str,
-) -> Option<Arc<crate::SessionBudget>> {
+fn inherited_session_budget(session_id: &str) -> Option<Arc<crate::SessionBudget>> {
     session_budget_for_session(session_id)
 }
 
@@ -155,9 +151,10 @@ fn child_session_budget(
     budget_usd: Option<f64>,
 ) -> Option<Arc<crate::SessionBudget>> {
     match (inherited_budget, budget_usd) {
-        (Some(parent_budget), Some(usd)) => {
-            Some(Arc::new(crate::SessionBudget::child_scope(parent_budget, usd)))
-        }
+        (Some(parent_budget), Some(usd)) => Some(Arc::new(crate::SessionBudget::child_scope(
+            parent_budget,
+            usd,
+        ))),
         (None, Some(usd)) => Some(Arc::new(crate::SessionBudget::new(usd))),
         (inherited_budget, None) => inherited_budget,
     }
@@ -220,10 +217,7 @@ fn encode_team_runner_observability(content: String, events: Vec<Value>) -> Stri
     match build_observability_metadata(events) {
         Some(metadata) => format!(
             "{}{}{}{}",
-            content,
-            TEAM_RUNNER_OBSERVABILITY_PREFIX,
-            metadata,
-            TEAM_RUNNER_OBSERVABILITY_SUFFIX
+            content, TEAM_RUNNER_OBSERVABILITY_PREFIX, metadata, TEAM_RUNNER_OBSERVABILITY_SUFFIX
         ),
         None => content,
     }
@@ -389,14 +383,11 @@ impl Tool for AgentTool {
         } else {
             parent_provider
         };
-        let requested_identity = match resolve_provider_identity(
-            provider_hint,
-            &model,
-            ctx.model_registry.as_deref(),
-        ) {
-            Ok(identity) => identity,
-            Err(e) => return ToolResult::error(format!("Provider resolution failed: {}", e)),
-        };
+        let requested_identity =
+            match resolve_provider_identity(provider_hint, &model, ctx.model_registry.as_deref()) {
+                Ok(identity) => identity,
+                Err(e) => return ToolResult::error(format!("Provider resolution failed: {}", e)),
+            };
 
         let registry = match ctx.provider_registry.as_ref() {
             Some(registry) => registry,
@@ -498,16 +489,12 @@ impl Tool for AgentTool {
                 (ctx.working_dir.display().to_string(), None, None)
             };
 
-        let session_budget = child_session_budget(
-            inherited_session_budget(&ctx.session_id),
-            params.budget_usd,
-        );
+        let session_budget =
+            child_session_budget(inherited_session_budget(&ctx.session_id), params.budget_usd);
 
         let query_config = QueryConfig {
             model: target.model_id.clone(),
-            max_tokens: params
-                .max_tokens
-                .unwrap_or(CHILD_AGENT_FALLBACK_MAX_TOKENS),
+            max_tokens: params.max_tokens.unwrap_or(CHILD_AGENT_FALLBACK_MAX_TOKENS),
             max_turns: params.max_turns.unwrap_or(10),
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
@@ -622,11 +609,9 @@ impl Tool for AgentTool {
         }
 
         let mut observability_events = vec![provider_event];
-        if let Some(event) = worker_budget_exceeded_event(
-            &agent_id,
-            session_budget.as_ref(),
-            params.budget_usd,
-        ) {
+        if let Some(event) =
+            worker_budget_exceeded_event(&agent_id, session_budget.as_ref(), params.budget_usd)
+        {
             observability_events.push(event);
         }
 
@@ -803,15 +788,12 @@ pub fn init_team_swarm_runner() {
                         .to_string()
                 });
 
-                let session_budget = child_session_budget(
-                    inherited_session_budget(&ctx.session_id),
-                    budget_usd,
-                );
+                let session_budget =
+                    child_session_budget(inherited_session_budget(&ctx.session_id), budget_usd);
 
                 let query_config = QueryConfig {
                     model: target.model_id.clone(),
-                    max_tokens: max_tokens_override
-                        .unwrap_or(CHILD_AGENT_FALLBACK_MAX_TOKENS),
+                    max_tokens: max_tokens_override.unwrap_or(CHILD_AGENT_FALLBACK_MAX_TOKENS),
                     max_turns: max_turns.unwrap_or(10),
                     system_prompt: Some(system_prompt),
                     working_directory: Some(ctx.working_dir.display().to_string()),
@@ -842,11 +824,9 @@ pub fn init_team_swarm_runner() {
                 .await;
 
                 let mut observability_events = vec![provider_event];
-                if let Some(event) = worker_budget_exceeded_event(
-                    &description,
-                    session_budget.as_ref(),
-                    budget_usd,
-                ) {
+                if let Some(event) =
+                    worker_budget_exceeded_event(&description, session_budget.as_ref(), budget_usd)
+                {
                     observability_events.push(event);
                 }
 
@@ -862,8 +842,8 @@ mod tests {
     use super::AgentTool;
     use async_trait::async_trait;
     use claurst_api::{
-        LlmProvider, ProviderCapabilities, ProviderError, ProviderRegistry, ProviderStatus,
-        StreamEvent, SystemPromptStyle,
+        LlmProvider, ModelRegistry, ProviderCapabilities, ProviderError, ProviderRegistry,
+        ProviderStatus, StreamEvent, SystemPromptStyle,
     };
     use claurst_core::config::{Config, PermissionMode};
     use claurst_core::permissions::AutoPermissionHandler;
@@ -880,6 +860,14 @@ mod tests {
 
     fn make_tool_context(
         provider_registry: Option<Arc<ProviderRegistry>>,
+        parent_provider: Option<&str>,
+    ) -> ToolContext {
+        make_tool_context_with_model_registry(provider_registry, None, parent_provider)
+    }
+
+    fn make_tool_context_with_model_registry(
+        provider_registry: Option<Arc<ProviderRegistry>>,
+        model_registry: Option<Arc<ModelRegistry>>,
         parent_provider: Option<&str>,
     ) -> ToolContext {
         let mut config = Config::default();
@@ -899,7 +887,7 @@ mod tests {
             mcp_manager: None,
             config,
             provider_registry,
-            model_registry: None,
+            model_registry,
         }
     }
 
@@ -909,6 +897,7 @@ mod tests {
         message_id: String,
         model_name: String,
         invocations: Arc<AtomicUsize>,
+        observed_max_tokens: Arc<Mutex<Vec<u32>>>,
         response_text: String,
     }
 
@@ -919,6 +908,7 @@ mod tests {
             message_id: &str,
             model_name: &str,
             invocations: Arc<AtomicUsize>,
+            observed_max_tokens: Arc<Mutex<Vec<u32>>>,
             response_text: impl Into<String>,
         ) -> Self {
             Self {
@@ -927,6 +917,7 @@ mod tests {
                 message_id: message_id.to_string(),
                 model_name: model_name.to_string(),
                 invocations,
+                observed_max_tokens,
                 response_text: response_text.into(),
             }
         }
@@ -951,12 +942,13 @@ mod tests {
 
         async fn create_message_stream(
             &self,
-            _request: claurst_api::ProviderRequest,
+            request: claurst_api::ProviderRequest,
         ) -> Result<
             Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
             ProviderError,
         > {
             self.invocations.fetch_add(1, Ordering::SeqCst);
+            self.observed_max_tokens.lock().push(request.max_tokens);
             Ok(Box::pin(stream::iter(vec![
                 Ok(StreamEvent::MessageStart {
                     id: self.message_id.clone(),
@@ -996,7 +988,7 @@ mod tests {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 streaming: true,
-                tool_calling: false,
+                tool_calling: true,
                 thinking: false,
                 image_input: false,
                 pdf_input: false,
@@ -1012,7 +1004,19 @@ mod tests {
     fn make_tracking_openai_registry(
         response_text: &str,
     ) -> (Arc<ProviderRegistry>, Arc<AtomicUsize>) {
+        let (registry, invocations, _) = make_tracking_openai_registry_with_tokens(response_text);
+        (registry, invocations)
+    }
+
+    fn make_tracking_openai_registry_with_tokens(
+        response_text: &str,
+    ) -> (
+        Arc<ProviderRegistry>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<u32>>>,
+    ) {
         let invocations = Arc::new(AtomicUsize::new(0));
+        let observed_max_tokens = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(TrackingStreamingProvider::new(
             "openai",
@@ -1020,17 +1024,26 @@ mod tests {
             "tracking-openai-message",
             "gpt-4o",
             invocations.clone(),
+            observed_max_tokens.clone(),
             response_text,
         )));
-        (Arc::new(registry), invocations)
+        (Arc::new(registry), invocations, observed_max_tokens)
     }
 
     fn make_mixed_tracking_registry(
         openai_response_text: &str,
         google_response_text: &str,
-    ) -> (Arc<ProviderRegistry>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    ) -> (
+        Arc<ProviderRegistry>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<u32>>>,
+        Arc<Mutex<Vec<u32>>>,
+    ) {
         let openai_invocations = Arc::new(AtomicUsize::new(0));
         let google_invocations = Arc::new(AtomicUsize::new(0));
+        let openai_max_tokens = Arc::new(Mutex::new(Vec::new()));
+        let google_max_tokens = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(TrackingStreamingProvider::new(
             "openai",
@@ -1038,6 +1051,7 @@ mod tests {
             "tracking-openai-message",
             "gpt-4o",
             openai_invocations.clone(),
+            openai_max_tokens.clone(),
             openai_response_text,
         )));
         registry.register(Arc::new(TrackingStreamingProvider::new(
@@ -1046,9 +1060,16 @@ mod tests {
             "tracking-google-message",
             "gemini-2.5-flash",
             google_invocations.clone(),
+            google_max_tokens.clone(),
             google_response_text,
         )));
-        (Arc::new(registry), openai_invocations, google_invocations)
+        (
+            Arc::new(registry),
+            openai_invocations,
+            google_invocations,
+            openai_max_tokens,
+            google_max_tokens,
+        )
     }
 
     struct EnvGuard {
@@ -1116,6 +1137,20 @@ mod tests {
             .unwrap();
 
         runtime.block_on(TeamCreateTool.execute(input, ctx))
+    }
+
+    fn split_encoded_team_output(output: &str) -> (String, Value) {
+        let start = output
+            .rfind(super::TEAM_RUNNER_OBSERVABILITY_PREFIX)
+            .expect("team output should include query observability suffix");
+        let payload_start = start + super::TEAM_RUNNER_OBSERVABILITY_PREFIX.len();
+        let payload_end = output.len() - super::TEAM_RUNNER_OBSERVABILITY_SUFFIX.len();
+
+        (
+            output[..start].to_string(),
+            serde_json::from_str(&output[payload_start..payload_end])
+                .expect("team observability payload should be valid JSON"),
+        )
     }
 
     #[test]
@@ -1187,14 +1222,118 @@ mod tests {
     }
 
     #[test]
+    fn agent_tool_respects_max_tokens_override() {
+        with_isolated_provider_auth(|| {
+            let sentinel = "max tokens sentinel";
+            let (registry, invocations, observed_max_tokens) =
+                make_tracking_openai_registry_with_tokens(sentinel);
+            let ctx = make_tool_context(Some(registry), None);
+
+            let result = run_agent_tool(
+                json!({
+                    "description": "max-tokens-override",
+                    "prompt": "use the provided max token limit",
+                    "provider": "openai",
+                    "model": "gpt-4o",
+                    "max_turns": 1,
+                    "max_tokens": 321
+                }),
+                &ctx,
+            );
+
+            assert!(!result.is_error, "unexpected error: {}", result.content);
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+            assert_eq!(&*observed_max_tokens.lock(), &[321]);
+        });
+    }
+
+    #[test]
+    fn agent_tool_allow_fallback_uses_same_domain_provider() {
+        with_isolated_provider_auth(|| {
+            let sentinel = "same-domain fallback sentinel";
+            let (registry, google_invocations, _) =
+                make_tracking_openai_registry_with_tokens(sentinel);
+            let ctx = make_tool_context_with_model_registry(
+                Some(registry),
+                Some(Arc::new(ModelRegistry::new())),
+                None,
+            );
+
+            let result = run_agent_tool(
+                json!({
+                    "description": "same-domain-fallback",
+                    "prompt": "fallback to another cloud provider",
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-6",
+                    "allow_fallback": true,
+                    "max_turns": 1
+                }),
+                &ctx,
+            );
+
+            assert!(!result.is_error, "unexpected error: {}", result.content);
+            assert_eq!(google_invocations.load(Ordering::SeqCst), 1);
+            assert_eq!(result.content, sentinel);
+        });
+    }
+
+    #[test]
+    fn child_session_budget_reuses_inherited_budget_when_child_limit_absent() {
+        let parent = Arc::new(crate::SessionBudget::new(7.5));
+        let inherited = super::child_session_budget(Some(parent.clone()), None)
+            .expect("inherited session budget should remain available");
+
+        assert!(Arc::ptr_eq(&parent, &inherited));
+    }
+
+    #[test]
+    fn child_session_budget_wraps_parent_when_child_limit_present() {
+        let parent = Arc::new(crate::SessionBudget::new(7.5));
+        let child = super::child_session_budget(Some(parent.clone()), Some(2.0))
+            .expect("child-local session budget should be created");
+
+        assert_eq!(child.limit_usd(), 2.0);
+        assert!(Arc::ptr_eq(&child.shared_budget(), &parent));
+
+        child.record_cost(1.25);
+        child.check_and_cancel();
+
+        assert_eq!(child.spent_usd(), 1.25);
+        assert_eq!(parent.spent_usd(), 1.25);
+        assert!(!child.is_cancelled());
+        assert!(!parent.is_cancelled());
+    }
+
+    #[test]
+    fn worker_budget_exceeded_event_reports_child_limit() {
+        let parent = Arc::new(crate::SessionBudget::new(10.0));
+        let child = Arc::new(crate::SessionBudget::child_scope(parent, 2.0));
+        child.record_cost(2.5);
+        child.check_and_cancel();
+
+        let event = super::worker_budget_exceeded_event("worker-a", Some(&child), Some(2.0))
+            .expect("child-local budget exceedance should emit an event");
+
+        assert_eq!(event["type"], json!("worker_budget_exceeded"));
+        assert_eq!(event["agent_id"], json!("worker-a"));
+        assert_eq!(event["cost_usd"], json!(2.5));
+        assert_eq!(event["limit_usd"], json!(2.0));
+    }
+
+    #[test]
     fn teamcreate_mixed_providers_per_agent_dispatch() {
         with_isolated_provider_auth(|| {
             init_team_swarm_runner_once();
 
             let openai_sentinel = "team openai provider sentinel";
             let google_sentinel = "team google provider sentinel";
-            let (registry, openai_invocations, google_invocations) =
-                make_mixed_tracking_registry(openai_sentinel, google_sentinel);
+            let (
+                registry,
+                openai_invocations,
+                google_invocations,
+                openai_max_tokens,
+                google_max_tokens,
+            ) = make_mixed_tracking_registry(openai_sentinel, google_sentinel);
             let ctx = make_tool_context(Some(registry), None);
 
             let result = run_team_create_tool(
@@ -1206,13 +1345,15 @@ mod tests {
                             "name": "agent-a",
                             "task": "return the openai sentinel",
                             "provider": "openai",
-                            "model": "gpt-4o"
+                            "model": "gpt-4o",
+                            "max_tokens": 321
                         },
                         {
                             "name": "agent-b",
                             "task": "return the google sentinel",
                             "provider": "google",
-                            "model": "gemini-2.5-flash"
+                            "model": "gemini-2.5-flash",
+                            "max_tokens": 654
                         }
                     ]
                 }),
@@ -1238,12 +1379,43 @@ mod tests {
                 .and_then(|entry| entry["output"].as_str())
                 .expect("agent-b output should be present");
 
-            assert_eq!(agent_a_output, openai_sentinel);
-            assert_eq!(agent_b_output, google_sentinel);
-            assert_ne!(agent_a_output, google_sentinel);
-            assert_ne!(agent_b_output, openai_sentinel);
+            let (agent_a_clean_output, agent_a_observability) =
+                split_encoded_team_output(agent_a_output);
+            let (agent_b_clean_output, agent_b_observability) =
+                split_encoded_team_output(agent_b_output);
+
+            assert_eq!(agent_a_clean_output, openai_sentinel);
+            assert_eq!(agent_b_clean_output, google_sentinel);
+            assert_ne!(agent_a_clean_output, google_sentinel);
+            assert_ne!(agent_b_clean_output, openai_sentinel);
+            assert_eq!(
+                agent_a_observability["query_observability_events"][0]["provider_id"],
+                json!("openai")
+            );
+            assert_eq!(
+                agent_a_observability["query_observability_events"][0]["model_id"],
+                json!("gpt-4o")
+            );
+            assert_eq!(
+                agent_a_observability["query_observability_events"][0]["was_fallback"],
+                json!(false)
+            );
+            assert_eq!(
+                agent_b_observability["query_observability_events"][0]["provider_id"],
+                json!("google")
+            );
+            assert_eq!(
+                agent_b_observability["query_observability_events"][0]["model_id"],
+                json!("gemini-2.5-flash")
+            );
+            assert_eq!(
+                agent_b_observability["query_observability_events"][0]["was_fallback"],
+                json!(false)
+            );
             assert_eq!(openai_invocations.load(Ordering::SeqCst), 1);
             assert_eq!(google_invocations.load(Ordering::SeqCst), 1);
+            assert_eq!(&*openai_max_tokens.lock(), &[321]);
+            assert_eq!(&*google_max_tokens.lock(), &[654]);
         });
     }
 }

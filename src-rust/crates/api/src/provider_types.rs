@@ -252,10 +252,41 @@ impl TrustDomain {
     /// Classifies providers using the hardcoded D2 trust-domain baseline.
     pub fn for_provider(provider_id: &str) -> TrustDomain {
         match provider_id {
-            "ollama" | "lmstudio" | "lm-studio" | "llamacpp" | "llama-cpp" => {
-                TrustDomain::Local
-            }
+            "ollama" | "lmstudio" | "lm-studio" | "llamacpp" | "llama-cpp" => TrustDomain::Local,
             _ => TrustDomain::Cloud,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrustDomain;
+
+    #[test]
+    fn trust_domain_marks_local_provider_aliases_as_local() {
+        for provider_id in ["ollama", "lmstudio", "lm-studio", "llamacpp", "llama-cpp"] {
+            assert_eq!(
+                TrustDomain::for_provider(provider_id),
+                TrustDomain::Local,
+                "expected {provider_id} to remain local",
+            );
+        }
+    }
+
+    #[test]
+    fn trust_domain_marks_non_local_providers_as_cloud() {
+        for provider_id in [
+            "anthropic",
+            "openai",
+            "google",
+            "openrouter",
+            "unknown-provider",
+        ] {
+            assert_eq!(
+                TrustDomain::for_provider(provider_id),
+                TrustDomain::Cloud,
+                "expected {provider_id} to remain cloud",
+            );
         }
     }
 }

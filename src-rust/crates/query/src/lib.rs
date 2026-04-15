@@ -558,7 +558,8 @@ fn emit_tool_observability_events(
         .unwrap_or_default();
 
     if tool_name == "TeamCreate" {
-        let (sanitized_content, mut team_events) = extract_team_runner_observability(&result.content);
+        let (sanitized_content, mut team_events) =
+            extract_team_runner_observability(&result.content);
         result.content = sanitized_content;
         events.append(&mut team_events);
     }
@@ -1352,7 +1353,11 @@ async fn run_query_loop_inner(
                 let turn_cost = (cost_tracker.total_cost_usd() - spent_before_turn).max(0.0);
                 session_budget.record_cost(turn_cost);
                 session_budget.check_and_cancel();
-                emit_session_budget_exceeded(event_tx.as_ref(), &shared_budget, was_shared_cancelled);
+                emit_session_budget_exceeded(
+                    event_tx.as_ref(),
+                    &shared_budget,
+                    was_shared_cancelled,
+                );
             }
 
             messages.push(assistant_msg.clone());
@@ -2717,6 +2722,111 @@ mod tests {
             options["reasoningConfig"]["budgetTokens"],
             serde_json::json!(10_000)
         );
+    }
+
+    #[test]
+    fn teamcreate_observability_is_sanitized_and_emitted() {
+        let encoded_output = format!(
+            "worker result{}{{\"query_observability_events\":[{{\"type\":\"worker_provider_resolved\",\"agent_id\":\"team/worker-a\",\"provider_id\":\"openai\",\"model_id\":\"gpt-4o\",\"was_fallback\":false}},{{\"type\":\"worker_budget_exceeded\",\"agent_id\":\"team/worker-a\",\"cost_usd\":1.25,\"limit_usd\":1.0}}]}}{}",
+            crate::agent_tool::TEAM_RUNNER_OBSERVABILITY_PREFIX,
+            crate::agent_tool::TEAM_RUNNER_OBSERVABILITY_SUFFIX,
+        );
+        let mut result = ToolResult::success(
+            serde_json::json!({
+                "results": [
+                    {
+                        "agent": "worker-a",
+                        "output": encoded_output,
+                    }
+                ],
+                "aggregated_output": "stale aggregate",
+            })
+            .to_string(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        emit_tool_observability_events("TeamCreate", &mut result, Some(&tx));
+
+        let payload: Value = serde_json::from_str(&result.content)
+            .expect("sanitized TeamCreate output is valid JSON");
+        assert_eq!(
+            payload["results"][0]["output"],
+            serde_json::json!("worker result")
+        );
+        assert_eq!(
+            payload["aggregated_output"],
+            serde_json::json!("## Agent: worker-a\n\nworker result")
+        );
+
+        match rx
+            .try_recv()
+            .expect("worker provider event should be emitted")
+        {
+            QueryEvent::WorkerProviderResolved {
+                agent_id,
+                provider_id,
+                model_id,
+                was_fallback,
+            } => {
+                assert_eq!(agent_id, "team/worker-a");
+                assert_eq!(provider_id, "openai");
+                assert_eq!(model_id, "gpt-4o");
+                assert!(!was_fallback);
+            }
+            other => panic!("unexpected first query event: {other:?}"),
+        }
+
+        match rx
+            .try_recv()
+            .expect("worker budget event should be emitted")
+        {
+            QueryEvent::WorkerBudgetExceeded {
+                agent_id,
+                cost_usd,
+                limit_usd,
+            } => {
+                assert_eq!(agent_id, "team/worker-a");
+                assert_eq!(cost_usd, 1.25);
+                assert_eq!(limit_usd, 1.0);
+            }
+            other => panic!("unexpected second query event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_budget_exceeded_event_emits_only_on_new_cancellation() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let budget = Arc::new(SessionBudget::new(1.0));
+
+        emit_session_budget_exceeded(Some(&tx), &budget, false);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        budget.record_cost(1.0);
+        budget.check_and_cancel();
+
+        emit_session_budget_exceeded(Some(&tx), &budget, false);
+        match rx
+            .try_recv()
+            .expect("session budget event should be emitted")
+        {
+            QueryEvent::SessionBudgetExceeded {
+                cost_usd,
+                limit_usd,
+            } => {
+                assert_eq!(cost_usd, 1.0);
+                assert_eq!(limit_usd, 1.0);
+            }
+            other => panic!("unexpected session budget query event: {other:?}"),
+        }
+
+        emit_session_budget_exceeded(Some(&tx), &budget, true);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 }
 
