@@ -218,12 +218,11 @@ impl BedrockProvider {
                 mac.update(service.as_bytes());
                 mac.finalize().into_bytes()
             };
-            let k_signing = {
+            {
                 let mut mac = HmacSha256::new_from_slice(&k_service).expect("HMAC init failed");
                 mac.update(b"aws4_request");
                 mac.finalize().into_bytes()
-            };
-            k_signing
+            }
         };
 
         let signature = {
@@ -316,23 +315,23 @@ impl BedrockProvider {
                     Role::User => "user",
                     Role::Assistant => "assistant",
                 };
-                let content = Self::message_content_to_converse(&msg.content, &msg.role);
+                let content = Self::message_content_to_converse(&msg.content);
                 json!({ "role": role, "content": content })
             })
             .collect()
     }
 
-    fn message_content_to_converse(content: &MessageContent, role: &Role) -> Vec<Value> {
+    fn message_content_to_converse(content: &MessageContent) -> Vec<Value> {
         match content {
             MessageContent::Text(t) => vec![json!({ "text": t })],
             MessageContent::Blocks(blocks) => blocks
                 .iter()
-                .filter_map(|b| Self::content_block_to_converse(b, role))
+                .filter_map(Self::content_block_to_converse)
                 .collect(),
         }
     }
 
-    fn content_block_to_converse(block: &ContentBlock, role: &Role) -> Option<Value> {
+    fn content_block_to_converse(block: &ContentBlock) -> Option<Value> {
         match block {
             ContentBlock::Text { text } => Some(json!({ "text": text })),
             ContentBlock::Image { source } => {
@@ -375,7 +374,7 @@ impl BedrockProvider {
                     ToolResultContent::Text(t) => vec![json!({ "text": t })],
                     ToolResultContent::Blocks(inner) => inner
                         .iter()
-                        .filter_map(|b| Self::content_block_to_converse(b, role))
+                        .filter_map(Self::content_block_to_converse)
                         .collect(),
                 };
                 let status = if is_error.unwrap_or(false) {
@@ -718,11 +717,7 @@ impl LlmProvider for BedrockProvider {
             }
 
             // Drain any remaining complete JSON in the buffer.
-            loop {
-                let start = match buf.iter().position(|&b| b == b'{') {
-                    Some(p) => p,
-                    None => break,
-                };
+            while let Some(start) = buf.iter().position(|&b| b == b'{') {
                 buf.drain(..start);
                 match serde_json::from_slice::<Value>(&buf) {
                     Ok(val) => {
