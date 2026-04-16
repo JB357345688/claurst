@@ -875,19 +875,22 @@ pub async fn run_query_loop(
     cancel_token: tokio_util::sync::CancellationToken,
     pending_messages: Option<&mut Vec<String>>,
 ) -> QueryOutcome {
-    with_registered_session_budget(
+    with_registered_session_health_cache(
         &tool_ctx.session_id,
-        config.session_budget.clone(),
-        run_query_loop_inner(
-            legacy_client,
-            messages,
-            tools,
-            tool_ctx,
-            config,
-            cost_tracker,
-            event_tx,
-            cancel_token,
-            pending_messages,
+        with_registered_session_budget(
+            &tool_ctx.session_id,
+            config.session_budget.clone(),
+            run_query_loop_inner(
+                legacy_client,
+                messages,
+                tools,
+                tool_ctx,
+                config,
+                cost_tracker,
+                event_tx,
+                cancel_token,
+                pending_messages,
+            ),
         ),
     )
     .await

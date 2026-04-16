@@ -8,10 +8,13 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     future::Future,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
-use crate::HealthCache;
+use crate::{register_session_health_cache, session_health_cache_for_session, HealthCache};
 use async_trait::async_trait;
 use claurst_api::{
     LlmProvider, ModelEntry, ModelInfo, ModelRegistry, OpenAiProvider, ProviderCapabilities,
@@ -25,6 +28,7 @@ struct TestProvider {
     name: String,
     health_status: ProviderStatus,
     capabilities: ProviderCapabilities,
+    health_calls: Arc<AtomicUsize>,
 }
 
 impl TestProvider {
@@ -45,6 +49,7 @@ impl TestProvider {
                 structured_output: false,
                 system_prompt_style: SystemPromptStyle::SystemMessage,
             },
+            health_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -56,6 +61,10 @@ impl TestProvider {
     fn with_capabilities(mut self, capabilities: ProviderCapabilities) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    fn health_calls(&self) -> Arc<AtomicUsize> {
+        self.health_calls.clone()
     }
 }
 
@@ -93,6 +102,7 @@ impl LlmProvider for TestProvider {
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
+        self.health_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.health_status.clone())
     }
 
@@ -175,8 +185,8 @@ fn assert_identity(
     expected_model: &str,
     expected_source: ResolutionSource,
 ) {
-    let identity =
-        resolve_provider_identity(explicit_provider, model, model_registry).expect("resolution should succeed");
+    let identity = resolve_provider_identity(explicit_provider, model, model_registry)
+        .expect("resolution should succeed");
 
     assert_eq!(identity.provider_id, expected_provider);
     assert_eq!(identity.model_id, expected_model);
@@ -487,7 +497,10 @@ fn provider_supports_capability_maps_provider_capability_fields() {
         system_prompt_style: SystemPromptStyle::SystemMessage,
     };
 
-    assert!(provider_supports_capability(&caps, &Capability::ToolCalling));
+    assert!(provider_supports_capability(
+        &caps,
+        &Capability::ToolCalling
+    ));
     assert!(!provider_supports_capability(&caps, &Capability::Reasoning));
     assert!(provider_supports_capability(&caps, &Capability::Vision));
     assert!(!provider_supports_capability(&caps, &Capability::PdfInput));
@@ -719,6 +732,91 @@ fn fallback_same_domain_returns_healthy_cloud_candidate() {
         assert_eq!(target.provider_id, "google");
         assert_eq!(target.model_id, "gemini-2.5-pro");
         assert_eq!(target.resolution_source, ResolutionSource::ModelRegistry);
+    });
+}
+
+#[test]
+fn fallback_same_session_reuses_registered_health_cache() {
+    with_isolated_provider_auth(|| {
+        let model_registry = ModelRegistry::new();
+        let provider = TestProvider::new("openai", "OpenAI")
+            .with_health_status(ProviderStatus::Healthy)
+            .with_capabilities(tool_calling_capabilities());
+        let health_calls = provider.health_calls();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(provider));
+
+        let session_id = "provider-resolution-session-reuse";
+        let cache = Arc::new(HealthCache::new());
+        let _registration = register_session_health_cache(session_id, &cache);
+
+        let first_cache = session_health_cache_for_session(session_id)
+            .expect("session health cache must be visible");
+        let first = run_async(resolve_provider_with_fallback(
+            Some("anthropic"),
+            "claude-sonnet-4-6",
+            Some(&model_registry),
+            &registry,
+            &HashMap::new(),
+            first_cache.as_ref(),
+            true,
+        ))
+        .expect("first fallback should succeed");
+
+        let second_cache = session_health_cache_for_session(session_id)
+            .expect("session health cache must remain visible");
+        let second = run_async(resolve_provider_with_fallback(
+            Some("anthropic"),
+            "claude-sonnet-4-6",
+            Some(&model_registry),
+            &registry,
+            &HashMap::new(),
+            second_cache.as_ref(),
+            true,
+        ))
+        .expect("second fallback should reuse cached health");
+
+        assert_eq!(first.provider_id, "openai");
+        assert_eq!(second.provider_id, "openai");
+        assert_eq!(health_calls.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
+fn fallback_session_scopes_do_not_share_cached_health() {
+    with_isolated_provider_auth(|| {
+        let model_registry = ModelRegistry::new();
+        let provider = TestProvider::new("openai", "OpenAI")
+            .with_health_status(ProviderStatus::Healthy)
+            .with_capabilities(tool_calling_capabilities());
+        let health_calls = provider.health_calls();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(provider));
+
+        for session_id in [
+            "provider-resolution-session-a",
+            "provider-resolution-session-b",
+        ] {
+            let cache = Arc::new(HealthCache::new());
+            let _registration = register_session_health_cache(session_id, &cache);
+            let session_cache = session_health_cache_for_session(session_id)
+                .expect("session health cache must be visible");
+
+            let target = run_async(resolve_provider_with_fallback(
+                Some("anthropic"),
+                "claude-sonnet-4-6",
+                Some(&model_registry),
+                &registry,
+                &HashMap::new(),
+                session_cache.as_ref(),
+                true,
+            ))
+            .expect("fallback should succeed");
+
+            assert_eq!(target.provider_id, "openai");
+        }
+
+        assert_eq!(health_calls.load(Ordering::SeqCst), 2);
     });
 }
 

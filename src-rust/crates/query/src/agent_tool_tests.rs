@@ -58,6 +58,7 @@ struct TrackingStreamingProvider {
     message_id: String,
     model_name: String,
     invocations: Arc<AtomicUsize>,
+    health_checks: Arc<AtomicUsize>,
     observed_max_tokens: Arc<Mutex<Vec<u32>>>,
     response_text: String,
 }
@@ -72,12 +73,35 @@ impl TrackingStreamingProvider {
         observed_max_tokens: Arc<Mutex<Vec<u32>>>,
         response_text: impl Into<String>,
     ) -> Self {
+        Self::new_with_health_counter(
+            provider_id,
+            provider_name,
+            message_id,
+            model_name,
+            invocations,
+            Arc::new(AtomicUsize::new(0)),
+            observed_max_tokens,
+            response_text,
+        )
+    }
+
+    fn new_with_health_counter(
+        provider_id: &str,
+        provider_name: &str,
+        message_id: &str,
+        model_name: &str,
+        invocations: Arc<AtomicUsize>,
+        health_checks: Arc<AtomicUsize>,
+        observed_max_tokens: Arc<Mutex<Vec<u32>>>,
+        response_text: impl Into<String>,
+    ) -> Self {
         Self {
             id: ProviderId::new(provider_id),
             name: provider_name.to_string(),
             message_id: message_id.to_string(),
             model_name: model_name.to_string(),
             invocations,
+            health_checks,
             observed_max_tokens,
             response_text: response_text.into(),
         }
@@ -143,6 +167,7 @@ impl LlmProvider for TrackingStreamingProvider {
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
+        self.health_checks.fetch_add(1, Ordering::SeqCst);
         Ok(ProviderStatus::Healthy)
     }
 
@@ -165,6 +190,28 @@ impl LlmProvider for TrackingStreamingProvider {
 fn make_tracking_openai_registry(response_text: &str) -> (Arc<ProviderRegistry>, Arc<AtomicUsize>) {
     let (registry, invocations, _) = make_tracking_openai_registry_with_tokens(response_text);
     (registry, invocations)
+}
+
+fn make_tracking_openai_registry_with_health(
+    response_text: &str,
+) -> (Arc<ProviderRegistry>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let health_checks = Arc::new(AtomicUsize::new(0));
+    let observed_max_tokens = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(
+        TrackingStreamingProvider::new_with_health_counter(
+            "openai",
+            "OpenAI",
+            "tracking-openai-message",
+            "gpt-4o",
+            invocations.clone(),
+            health_checks.clone(),
+            observed_max_tokens,
+            response_text,
+        ),
+    ));
+    (Arc::new(registry), invocations, health_checks)
 }
 
 fn make_tracking_openai_registry_with_tokens(
@@ -412,8 +459,7 @@ fn agent_tool_respects_max_tokens_override() {
 fn agent_tool_allow_fallback_uses_same_domain_provider() {
     with_isolated_provider_auth(|| {
         let sentinel = "same-domain fallback sentinel";
-        let (registry, google_invocations, _) =
-            make_tracking_openai_registry_with_tokens(sentinel);
+        let (registry, google_invocations, _) = make_tracking_openai_registry_with_tokens(sentinel);
         let ctx = make_tool_context_with_model_registry(
             Some(registry),
             Some(Arc::new(ModelRegistry::new())),
@@ -435,6 +481,87 @@ fn agent_tool_allow_fallback_uses_same_domain_provider() {
         assert!(!result.is_error, "unexpected error: {}", result.content);
         assert_eq!(google_invocations.load(Ordering::SeqCst), 1);
         assert_eq!(result.content, sentinel);
+    });
+}
+
+#[test]
+fn child_and_team_fallback_share_session_health_cache() {
+    with_isolated_provider_auth(|| {
+        init_team_swarm_runner_once();
+
+        let sentinel = "shared session fallback sentinel";
+        let (registry, invocations, health_checks) =
+            make_tracking_openai_registry_with_health(sentinel);
+        let ctx = make_tool_context_with_model_registry(
+            Some(registry),
+            Some(Arc::new(ModelRegistry::new())),
+            None,
+        );
+
+        {
+            let cache = Arc::new(crate::HealthCache::new());
+            let _registration = crate::register_session_health_cache(&ctx.session_id, &cache);
+
+            let agent_result = run_agent_tool(
+                json!({
+                    "description": "agent-fallback",
+                    "prompt": "return the shared fallback sentinel",
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-6",
+                    "allow_fallback": true,
+                    "max_turns": 1
+                }),
+                &ctx,
+            );
+
+            assert!(
+                !agent_result.is_error,
+                "unexpected agent error: {}",
+                agent_result.content
+            );
+            assert_eq!(agent_result.content, sentinel);
+
+            let team_result = run_team_create_tool(
+                json!({
+                    "team_name": "fallback-team",
+                    "task": "return the shared fallback sentinel",
+                    "agents": [
+                        {
+                            "name": "agent-a",
+                            "task": "return the shared fallback sentinel",
+                            "provider": "anthropic",
+                            "model": "claude-sonnet-4-6",
+                            "allow_fallback": true,
+                            "max_turns": 1
+                        }
+                    ]
+                }),
+                &ctx,
+            );
+
+            assert!(
+                !team_result.is_error,
+                "unexpected team error: {}",
+                team_result.content
+            );
+
+            let payload: Value = serde_json::from_str(&team_result.content)
+                .expect("team result should be valid JSON");
+            let team_output = payload["results"][0]["output"]
+                .as_str()
+                .expect("team output should be present");
+            let (clean_output, observability) = split_encoded_team_output(team_output);
+
+            assert_eq!(clean_output, sentinel);
+            assert_eq!(
+                observability["query_observability_events"][0]["provider_id"],
+                json!("openai")
+            );
+        }
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+        assert_eq!(health_checks.load(Ordering::SeqCst), 1);
+        assert!(crate::session_health_cache_for_session(&ctx.session_id).is_none());
     });
 }
 

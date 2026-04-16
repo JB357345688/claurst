@@ -1,12 +1,19 @@
+use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use claurst_api::{LlmProvider, ProviderStatus};
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use once_cell::sync::Lazy;
 
 const DEFAULT_TTL: Duration = Duration::from_secs(30);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT_REASON: &str = "health check timed out";
 const PROBE_FAILURE_REASON: &str = "health check failed";
+
+static SESSION_HEALTH_CACHE_REGISTRY: Lazy<DashMap<String, (Arc<HealthCache>, usize)>> =
+    Lazy::new(DashMap::new);
 
 #[derive(Debug, Default)]
 pub struct HealthCache {
@@ -68,9 +75,73 @@ impl HealthCache {
     }
 }
 
+#[derive(Debug)]
+pub struct SessionHealthCacheRegistration {
+    session_id: String,
+}
+
+impl Drop for SessionHealthCacheRegistration {
+    fn drop(&mut self) {
+        if let Entry::Occupied(mut entry) =
+            SESSION_HEALTH_CACHE_REGISTRY.entry(self.session_id.clone())
+        {
+            let should_remove = {
+                let (_, registrations) = entry.get_mut();
+                *registrations -= 1;
+                *registrations == 0
+            };
+            if should_remove {
+                entry.remove();
+            }
+        }
+    }
+}
+
+pub fn register_session_health_cache(
+    session_id: &str,
+    cache: &Arc<HealthCache>,
+) -> SessionHealthCacheRegistration {
+    match SESSION_HEALTH_CACHE_REGISTRY.entry(session_id.to_string()) {
+        Entry::Occupied(mut entry) => {
+            let (_, registrations) = entry.get_mut();
+            *registrations += 1;
+        }
+        Entry::Vacant(entry) => {
+            entry.insert((cache.clone(), 1));
+        }
+    }
+
+    SessionHealthCacheRegistration {
+        session_id: session_id.to_string(),
+    }
+}
+
+pub fn session_health_cache_for_session(session_id: &str) -> Option<Arc<HealthCache>> {
+    SESSION_HEALTH_CACHE_REGISTRY
+        .get(session_id)
+        .map(|entry| entry.value().0.clone())
+}
+
+pub fn session_health_cache_or_new(session_id: &str) -> Arc<HealthCache> {
+    session_health_cache_for_session(session_id).unwrap_or_else(|| Arc::new(HealthCache::new()))
+}
+
+pub async fn with_registered_session_health_cache<Fut, T>(session_id: &str, future: Fut) -> T
+where
+    Fut: Future<Output = T>,
+{
+    let cache = Arc::new(HealthCache::new());
+    let _registration = register_session_health_cache(session_id, &cache);
+    future.await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{HealthCache, PROBE_FAILURE_REASON, PROBE_TIMEOUT_REASON};
+    use super::{
+        register_session_health_cache, session_health_cache_for_session,
+        with_registered_session_health_cache, HealthCache, PROBE_FAILURE_REASON,
+        PROBE_TIMEOUT_REASON,
+    };
     use async_trait::async_trait;
     use claurst_api::{
         LlmProvider, ModelInfo, ProviderCapabilities, ProviderError, ProviderRequest,
@@ -219,6 +290,58 @@ mod tests {
         );
 
         assert!(cache.get("provider-a").is_none());
+    }
+
+    #[test]
+    fn health_cache_registration_exposes_cache_for_session() {
+        let cache = Arc::new(HealthCache::new());
+        let _registration = register_session_health_cache("health-cache-visible", &cache);
+
+        let inherited = session_health_cache_for_session("health-cache-visible")
+            .expect("health cache must register");
+
+        assert!(Arc::ptr_eq(&cache, &inherited));
+    }
+
+    #[test]
+    fn health_cache_registration_releases_when_last_guard_drops() {
+        let cache = Arc::new(HealthCache::new());
+
+        {
+            let _registration = register_session_health_cache("health-cache-release", &cache);
+            assert!(session_health_cache_for_session("health-cache-release").is_some());
+        }
+
+        assert!(session_health_cache_for_session("health-cache-release").is_none());
+    }
+
+    #[test]
+    fn health_cache_nested_registration_preserves_initial_owner() {
+        let root = Arc::new(HealthCache::new());
+        let child = Arc::new(HealthCache::new());
+        let _root_registration = register_session_health_cache("health-cache-nested-owner", &root);
+
+        {
+            let _child_registration =
+                register_session_health_cache("health-cache-nested-owner", &child);
+            let inherited = session_health_cache_for_session("health-cache-nested-owner")
+                .expect("root health cache must stay visible");
+            assert!(Arc::ptr_eq(&root, &inherited));
+        }
+
+        let inherited = session_health_cache_for_session("health-cache-nested-owner")
+            .expect("root health cache must remain registered");
+        assert!(Arc::ptr_eq(&root, &inherited));
+    }
+
+    #[tokio::test]
+    async fn with_registered_session_health_cache_registers_and_cleans_up() {
+        with_registered_session_health_cache("health-cache-scope", async {
+            assert!(session_health_cache_for_session("health-cache-scope").is_some());
+        })
+        .await;
+
+        assert!(session_health_cache_for_session("health-cache-scope").is_none());
     }
 
     #[tokio::test]

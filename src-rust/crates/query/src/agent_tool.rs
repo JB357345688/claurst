@@ -31,7 +31,10 @@ use tracing::{debug, info, warn};
 use crate::provider_resolution::{
     resolve_provider_identity, resolve_provider_with_fallback, ExecutionTarget, KNOWN_PROVIDERS,
 };
-use crate::{run_query_loop, session_budget_for_session, HealthCache, QueryConfig, QueryOutcome};
+use crate::{
+    run_query_loop, session_budget_for_session, session_health_cache_or_new, QueryConfig,
+    QueryOutcome,
+};
 
 // ---------------------------------------------------------------------------
 // Background agent registry
@@ -136,6 +139,10 @@ pub(crate) const TEAM_RUNNER_OBSERVABILITY_SUFFIX: &str = "]]";
 
 fn inherited_session_budget(session_id: &str) -> Option<Arc<crate::SessionBudget>> {
     session_budget_for_session(session_id)
+}
+
+fn inherited_session_health_cache(session_id: &str) -> Arc<crate::HealthCache> {
+    session_health_cache_or_new(session_id)
 }
 
 fn inherited_child_cancel_token(
@@ -400,14 +407,14 @@ impl Tool for AgentTool {
         };
 
         let allow_fallback = params.allow_fallback.unwrap_or(false);
-        let health_cache = HealthCache::new();
+        let health_cache = inherited_session_health_cache(&ctx.session_id);
         let target = match resolve_provider_with_fallback(
             provider_hint,
             &model,
             ctx.model_registry.as_deref(),
             registry,
             &ctx.config.provider_configs,
-            &health_cache,
+            health_cache.as_ref(),
             allow_fallback,
         )
         .await
@@ -755,14 +762,14 @@ pub fn init_team_swarm_runner() {
                     }
                 };
 
-                let health_cache = HealthCache::new();
+                let health_cache = inherited_session_health_cache(&ctx.session_id);
                 let target = match resolve_provider_with_fallback(
                     provider_override.as_deref().filter(|p| !p.is_empty()),
                     &model,
                     ctx.model_registry.as_deref(),
                     &registry,
                     &ctx.config.provider_configs,
-                    &health_cache,
+                    health_cache.as_ref(),
                     allow_fallback,
                 )
                 .await
