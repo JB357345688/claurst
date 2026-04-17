@@ -996,7 +996,11 @@ pub mod config {
         pub fn effective_output_style(&self) -> crate::system_prompt::OutputStyle {
             self.output_style
                 .as_deref()
-                .map(|style| style.parse::<crate::system_prompt::OutputStyle>().unwrap_or_default())
+                .map(|style| {
+                    style
+                        .parse::<crate::system_prompt::OutputStyle>()
+                        .unwrap_or_default()
+                })
                 .unwrap_or_default()
         }
 

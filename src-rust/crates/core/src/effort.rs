@@ -136,12 +136,7 @@ mod tests {
             EffortLevel::Max,
         ] {
             let parsed = level.as_str().parse::<EffortLevel>();
-            assert_eq!(
-                parsed,
-                Ok(level),
-                "from_str({:?}) should round-trip",
-                level
-            );
+            assert_eq!(parsed, Ok(level), "from_str({:?}) should round-trip", level);
         }
     }
 

@@ -5,8 +5,8 @@
 //! volatile, session-specific sections follow it.
 
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -109,7 +109,6 @@ impl OutputStyle {
             OutputStyle::Default => None,
         }
     }
-
 }
 
 impl std::str::FromStr for OutputStyle {
@@ -618,9 +617,18 @@ mod tests {
 
     #[test]
     fn test_output_style_from_str() {
-        assert_eq!("concise".parse::<OutputStyle>().unwrap(), OutputStyle::Concise);
-        assert_eq!("FORMAL".parse::<OutputStyle>().unwrap(), OutputStyle::Formal);
-        assert_eq!("unknown".parse::<OutputStyle>().unwrap(), OutputStyle::Default);
+        assert_eq!(
+            "concise".parse::<OutputStyle>().unwrap(),
+            OutputStyle::Concise
+        );
+        assert_eq!(
+            "FORMAL".parse::<OutputStyle>().unwrap(),
+            OutputStyle::Formal
+        );
+        assert_eq!(
+            "unknown".parse::<OutputStyle>().unwrap(),
+            OutputStyle::Default
+        );
     }
 
     #[test]

@@ -303,9 +303,7 @@ impl GoogleProvider {
 
                         let filtered: Vec<Value> = req_arr
                             .into_iter()
-                            .filter(|v| {
-                                v.as_str().map(|s| prop_keys.contains(s)).unwrap_or(false)
-                            })
+                            .filter(|v| v.as_str().map(|s| prop_keys.contains(s)).unwrap_or(false))
                             .collect();
                         map.insert("required".to_string(), Value::Array(filtered));
                     }

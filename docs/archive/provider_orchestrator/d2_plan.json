@@ -1,0 +1,111 @@
+{
+  "written_to_disk": true,
+  "mode": "plan_only",
+  "task": "D2 micro-patch / implementation implications review",
+  "executive_judgment": {
+    "choice": 2,
+    "label": "implementation micro-patch only",
+    "interpretation": "test-only micro-patch; no production behavior change; no RFC edit required"
+  },
+  "recommended_scope": {
+    "exact_next_step": "Add one narrow regression/unit test that locks the documented D2 behavior for custom/unknown providers: unrecognized provider IDs default to TrustDomain::Cloud and are treated consistently by D2 fallback.",
+    "minimum_safe_scope_reasoning": [
+      "RFC v3.1 already documents the limitation clearly",
+      "RFC v3.1 already settles explicit provider pinning semantics",
+      "A production guardrail patch would widen scope into the deferred custom trust-domain/config contract"
+    ],
+    "classification": "documentation_plus_regression_test",
+    "production_guardrails_recommended": false,
+    "rfc_micro_patch_recommended": false
+  },
+  "judgments": {
+    "custom_unknown_provider_cloud_default": {
+      "status": "documented_in_rfc_v3_1",
+      "needs": [
+        "regression_test"
+      ],
+      "does_not_need": [
+        "new_guardrail_subsystem",
+        "new_trust_domain_config",
+        "new_provider_exclusion_mechanism"
+      ]
+    },
+    "explicit_provider_pinning_semantics": {
+      "status": "settled",
+      "notes": [
+        "all explicit providers are true pins",
+        "anthropic is no longer a special case",
+        "conflicting known provider/model prefixes are explicit errors"
+      ]
+    },
+    "provider_model_compatibility_edge_case": {
+      "status": "deserves_test_if_not_already_covered",
+      "primary_case": "provider=anthropic with model=openai/gpt-4.1 should raise ProviderModelConflict"
+    }
+  },
+  "likely_touchpoints": [
+    {
+      "path": "/home/jordi/claurst/src-rust/crates/query/src/provider_resolution.rs",
+      "role": "primary D2 trust-domain and fallback logic; likely home for unit regression"
+    },
+    {
+      "path": "/home/jordi/claurst/src-rust/crates/query/tests/",
+      "role": "possible integration/regression location if behavior is tested through query entrypoints"
+    },
+    {
+      "path": "/home/jordi/claurst/src-rust/crates/query/src/agent_tool.rs",
+      "role": "inspect only if worker fallback wiring needs confirmation"
+    },
+    {
+      "path": "/home/jordi/claurst/src-rust/crates/tools/src/team_tool.rs",
+      "role": "inspect only if TeamCreate path shares tested fallback behavior"
+    },
+    {
+      "path": "/home/jordi/claurst/src-rust/crates/api/src/model_registry.rs",
+      "role": "inspect only if fallback model-selection or compatibility resolution is implicated"
+    }
+  ],
+  "risks": {
+    "if_patch_too_little": [
+      "documented Cloud-default behavior for unknown/custom providers may drift from implementation",
+      "self-hosted OpenAI-compatible endpoints may behave inconsistently during D2 fallback",
+      "future contributors may introduce ad hoc fixes that contradict v3.1"
+    ],
+    "if_over_engineer": [
+      "accidentally introduce a new trust-domain subsystem",
+      "widen scope with config such as trust_domain or provider exclusion lists",
+      "violate v3.1 intent by solving deferred problems prematurely"
+    ]
+  },
+  "gating_questions": [
+    {
+      "id": "lock_full_cloud_candidacy_or_only_classification",
+      "question": "Should the regression lock full documented behavior that unknown/custom providers may participate as Cloud fallback candidates, or only the narrower rule that they classify as TrustDomain::Cloud?"
+    },
+    {
+      "id": "fallback_behavior_when_provider_none",
+      "question": "For unpinned workers with provider=None, is fallback intended only when allow_fallback=true, or is fallback allowed by default after normal resolution fails?"
+    },
+    {
+      "id": "include_reverse_conflict_test_now",
+      "question": "Should the next patch also include a small D1 regression test for provider=anthropic with model=openai/gpt-4.1 if that coverage is missing?"
+    }
+  ],
+  "narrow_execution_plan_if_approved": [
+    "Inspect TrustDomain::for_provider() implementation",
+    "Inspect D2 fallback candidate enumeration",
+    "Add one focused regression test with one built-in Cloud provider and one unknown/custom provider ID",
+    "Assert only the RFC v3.1 documented behavior",
+    "Do not add config fields, exclusion knobs, or locality heuristics",
+    "Verify whether reverse explicit-pin conflict and anthropic true-pin cases are already covered by D1 tests",
+    "Run targeted provider-resolution tests first"
+  ],
+  "source_documents_reviewed": [
+    "/home/jordi/claurst/RFC_PROVIDER_AWARE_WORKER_FABRIC_v3.1.md",
+    "/home/jordi/claurst/RFC_PROVIDER_AWARE_WORKER_FABRIC_v3.md",
+    "/home/jordi/claurst/RFC_PROVIDER_AWARE_WORKER_FABRIC_v2_REVIEW.md",
+    "/home/jordi/claurst/FUNCTIONAL_SPEC.md",
+    "/home/jordi/claurst/Codex5.4_FEATURE_BRAINSTORM.md",
+    "/home/jordi/claurst/FEATURE_BRAINSTORM.md"
+  ]
+}
